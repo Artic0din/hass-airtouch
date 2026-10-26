@@ -3,8 +3,9 @@
 The console inserts a zero after every three 0x55 bytes that follow the inner
 header prefix, including the checksum. pyairtouch encodes the logical header
 and checksum. This module adds that escape and reads one matching frame before
-the deadline. Extended history uses message 0x1F. Preference settings use the
-same framing with control message 0xC0.
+the deadline. Extended history uses message 0x1F and repeats the request.
+Smart settings use that message with an FF 18 reply prefix. Preference
+settings use the same framing with control message 0xC0.
 """
 
 from __future__ import annotations
@@ -85,18 +86,26 @@ class ConsoleClient:
         self._lock = asyncio.Lock()
         self._packet_id = 1
 
-    async def request(self, payload: bytes) -> bytes:
-        """Send one extended request and return the bytes after its echo.
+    async def request(
+        self,
+        payload: bytes,
+        *,
+        response_prefix: bytes | None = None,
+    ) -> bytes:
+        """Send one extended request and return the bytes after the matched prefix.
 
-        Unrelated valid frames are ignored until the deadline. A bad header
-        or checksum ends the exchange. The connection lock is released on
-        cancellation.
+        History replies repeat the request, so the default prefix is the whole
+        payload. Smart settings pass an FF 18 prefix because a write is
+        answered with a new body. Unrelated valid frames are ignored until
+        the deadline. A bad header or checksum ends the exchange. The
+        connection lock is released on cancellation.
         """
+        prefix = payload if response_prefix is None else response_prefix
         return await self._exchange(
             to_address=ADDRESS_AIRTOUCH_EXTENDED,
             message_id=EXTENDED_MESSAGE_ID,
             payload=payload,
-            echo_prefix=payload,
+            echo_prefix=prefix,
         )
 
     async def exchange_control(self, payload: bytes) -> bytes:

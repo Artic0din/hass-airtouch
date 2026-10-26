@@ -141,6 +141,11 @@
       "away_maximum": {
         "name": "Away maximum"
       }
+    },
+    "switch": {
+      "energy_wastage_detection": {
+        "name": "Energy wastage detection"
+      }
     }
   },
   "services": {

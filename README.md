@@ -319,6 +319,41 @@ Climate entities keep using the main console connection.
 
 </details>
 
+### :window: Switch: Energy wastage detection
+An AirTouch 5 console gets one [**switch**][hass-switch] for energy wastage detection.
+The switch belongs to the console, not to an individual air conditioner.
+AirTouch 4 consoles do not get this switch.
+
+The console watches running temperature-controlled zones for warming during cooling or cooling during heating.
+It can warn after a change of at least 2°C within 10 minutes, indicating a possible open door, open window, or airflow problem.
+The switch enables or disables that check.
+
+Each change reads fresh settings and preserves the other settings, including weather adaptation and auto-off.
+The switch shows a new state only after the console confirms it.
+A failed change leaves the switch at the last confirmed on or off state, and Home Assistant reports the error.
+Changes are blocked if the console reports a disabled weather-adaptation differential.
+The console's write handler cannot preserve that disabled value when settings are sent back.
+Set a numeric differential on the console before changing this switch.
+
+The integration reads this setting about once a minute on its own short connection.
+When that periodic read fails, the switch becomes unavailable until the next successful read.
+Climate entities keep using the main console connection.
+A failed read while Home Assistant is setting up this switch does not stop the climate entities from loading.
+
+`switch.<console_name>_energy_wastage_detection`
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `on` | Energy wastage detection is enabled.
+ `off` | Energy wastage detection is disabled.
+ `unavailable` | The latest periodic settings read failed. A failed change stays on the last confirmed state.
+
+</details>
+
 ### :battery: Binary Sensor: Battery (`binary_sensor.<zone_name>_battery`)
 A [**binary sensor**][hass-binary] is created for each zone with a temperature sensor to represent the battery state.
 
@@ -481,6 +516,7 @@ If you would like to make a donation as appreciation of my work:
 [hass-customizing-entities]: https://www.home-assistant.io/docs/configuration/customizing-devices/
 [hass-number]: https://www.home-assistant.io/integrations/number/
 [hass-sensor]: https://www.home-assistant.io/integrations/sensor/
+[hass-switch]: https://www.home-assistant.io/integrations/switch/
 [hass-time]: https://www.home-assistant.io/integrations/time/
 [hass-update]: https://www.home-assistant.io/integrations/update/
 [license-shield]: https://img.shields.io/github/license/thenoctambulist/hass-airtouch.svg

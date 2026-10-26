@@ -36,6 +36,11 @@
       "away_maximum": {
         "default": "mdi:thermometer-high"
       }
+    },
+    "switch": {
+      "energy_wastage_detection": {
+        "default": "mdi:window-open"
+      }
     }
   },
   "services": {
