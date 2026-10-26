@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import devices
+from .ac_settings import async_collect_ac_setting_numbers
 from .const import DOMAIN
 from .preferences import (
     PREFERENCE_LIMITS,
@@ -85,6 +86,9 @@ async def async_setup_entry(
             unique_id=device.unique_id,
             device_info=device.device_info,
         )
+    )
+    async_add_entities(
+        await async_collect_ac_setting_numbers(hass, config_entry, airtouch)
     )
 
 

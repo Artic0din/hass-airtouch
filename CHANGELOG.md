@@ -8,6 +8,7 @@
 - Added AirTouch 5 console numbers for sleep cool, sleep heat, away minimum, and away maximum.
 - Added an AirTouch 5 console switch for energy wastage detection.
 - Added AirTouch 5 weather-adaptation switches and differential and comfort numbers on the console.
+- Added per-air-conditioner cool and heat limits and an auto-off duration for AirTouch 5.
 
 ### Fixed
 

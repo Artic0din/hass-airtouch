@@ -152,6 +152,21 @@
       },
       "weather_adaptation_heat_target": {
         "name": "Weather adaptation heat target"
+      },
+      "cool_minimum": {
+        "name": "Cool minimum"
+      },
+      "cool_maximum": {
+        "name": "Cool maximum"
+      },
+      "heat_minimum": {
+        "name": "Heat minimum"
+      },
+      "heat_maximum": {
+        "name": "Heat maximum"
+      },
+      "auto_off_duration": {
+        "name": "Auto off duration"
       }
     },
     "switch": {
