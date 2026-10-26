@@ -1,8 +1,8 @@
-"""The console keeps the flag in the smart-settings information block.
+"""The console keeps smart settings in one information block.
 
-A write sends that block back with the flag changed, an action count of 0, and a
-stride of 0. It does not send the state records from the last read. Those
-records can change an air-conditioner or zone setpoint.
+A write sends that block back with the requested bytes changed, an action
+count of 0, and a stride of 0. It does not send the state records from the
+last read. Those records can change an air-conditioner or zone setpoint.
 """
 
 from __future__ import annotations
@@ -11,13 +11,16 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from homeassistant.config_entries import current_entry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from pyairtouch import AirTouchModel
 from pyairtouch.at5.api import DEFAULT_PORT_NUMBER
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from pyairtouch import AirTouch
@@ -26,6 +29,7 @@ from .console import DEFAULT_DEADLINE, ConsoleClient, ConsoleProtocolError
 
 _LOGGER = logging.getLogger(__name__)
 
+_OWNERS_KEY: Final = "airtouch_smart_settings"
 _SUBCOMMAND: Final = 0xFF
 _SMART_SETTING_ID: Final = 0x18
 _QUERY: Final = bytes((_SUBCOMMAND, _SMART_SETTING_ID))
@@ -98,8 +102,8 @@ def parse_smart_settings(body: bytes) -> SmartSettingsSnapshot:
     return SmartSettingsSnapshot(body[_INFO_OFFSET:info_end])
 
 
-class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
-    """Poll the flag and publish a write only after readback.
+class SmartSettingsCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
+    """Poll one entry's smart settings and publish a write only after readback.
 
     A failed poll leaves the previous snapshot stored and marks the update
     failed, so the switch becomes unavailable. A failed write leaves that
@@ -117,12 +121,13 @@ class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
     ) -> None:
         self._client = ConsoleClient(airtouch.host, port, deadline=deadline)
         self._transaction_lock = asyncio.Lock()
+        self._closed = False
         token = current_entry.set(entry)
         try:
             super().__init__(
                 hass,
                 _LOGGER,
-                name="AirTouch energy wastage",
+                name="AirTouch smart settings",
                 update_interval=timedelta(seconds=_UPDATE_INTERVAL),
             )
         finally:
@@ -132,17 +137,35 @@ class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
         """Change detection after a fresh read and a matching readback."""
         if not isinstance(enabled, bool):
             raise SmartSettingsRejectedError("energy wastage must be on or off")
+        await self._async_patch(
+            lambda snapshot: snapshot.with_energy_wastage(enabled=enabled).info
+        )
+
+    async def async_shutdown(self) -> None:
+        """Refuse new work, stop scheduling, and wait for an admitted transaction."""
+        self._closed = True
+        await super().async_shutdown()
         async with self._transaction_lock:
+            pass
+
+    async def _async_patch(
+        self, patch: Callable[[SmartSettingsSnapshot], bytes]
+    ) -> None:
+        async with self._transaction_lock:
+            if self._closed:
+                raise SmartSettingsExchangeError("smart settings owner is closed")
             fresh = await self._read_snapshot()
-            patched = fresh.with_energy_wastage(enabled=enabled)
-            await self._write_info(patched.info)
+            info = patch(fresh)
+            await self._write_info(info)
             confirmed = await self._read_snapshot()
-            if confirmed.info != patched.info:
-                raise SmartSettingsExchangeError("energy wastage readback differed")
+            if confirmed.info != info:
+                raise SmartSettingsExchangeError("smart settings readback differed")
             self.async_set_updated_data(confirmed)
 
     async def _async_update_data(self) -> SmartSettingsSnapshot:
         async with self._transaction_lock:
+            if self._closed:
+                raise UpdateFailed("smart settings owner is closed")
             try:
                 return await self._read_snapshot()
             except SmartSettingsExchangeError as err:
@@ -158,7 +181,7 @@ class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
             OSError,
             TimeoutError,
         ) as err:
-            raise SmartSettingsExchangeError("energy wastage read failed") from err
+            raise SmartSettingsExchangeError("smart settings read failed") from err
 
     async def _write_info(self, info: bytes) -> None:
         # The console's write handler turns a disabled -1 differential into 255.
@@ -180,9 +203,67 @@ class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
             OSError,
             TimeoutError,
         ) as err:
-            raise SmartSettingsExchangeError("energy wastage write failed") from err
+            raise SmartSettingsExchangeError("smart settings write failed") from err
         if confirmed.info != info:
-            raise SmartSettingsExchangeError("energy wastage write was not stored")
+            raise SmartSettingsExchangeError("smart settings write was not stored")
+
+
+def async_install(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    airtouch: AirTouch,
+    *,
+    port: int = DEFAULT_PORT_NUMBER,
+    deadline: float = DEFAULT_DEADLINE,
+) -> SmartSettingsCoordinator | None:
+    """Install one AirTouch 5 owner for this entry without network I/O.
+
+    A second install is rejected. Reload installs a new owner after release.
+    """
+    if airtouch.model != AirTouchModel.AIRTOUCH_5:
+        return None
+    owners = _owners(hass)
+    if entry.entry_id in owners:
+        raise RuntimeError("smart settings owner is already installed")
+    coordinator = SmartSettingsCoordinator(
+        hass, entry, airtouch, port=port, deadline=deadline
+    )
+    owners[entry.entry_id] = coordinator
+    return coordinator
+
+
+def get_smart_settings(hass: HomeAssistant, entry_id: str) -> SmartSettingsCoordinator:
+    """Return the owner installed for this config entry."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if isinstance(stored, dict):
+        coordinator = stored.get(entry_id)
+        if isinstance(coordinator, SmartSettingsCoordinator):
+            return coordinator
+    raise RuntimeError("smart settings owner is not installed")
+
+
+async def async_release(hass: HomeAssistant, entry_id: str) -> None:
+    """Stop and forget this entry's owner. A missing owner is left unchanged."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if not isinstance(stored, dict):
+        return
+    owners = cast("dict[str, SmartSettingsCoordinator]", stored)
+    coordinator = owners.pop(entry_id, None)
+    if not owners:
+        hass.data.pop(_OWNERS_KEY, None)
+    if isinstance(coordinator, SmartSettingsCoordinator):
+        await coordinator.async_shutdown()
+
+
+def _owners(hass: HomeAssistant) -> dict[str, SmartSettingsCoordinator]:
+    stored = hass.data.get(_OWNERS_KEY)
+    if stored is None:
+        created: dict[str, SmartSettingsCoordinator] = {}
+        hass.data[_OWNERS_KEY] = created
+        return created
+    if not isinstance(stored, dict):
+        raise TypeError("smart settings owner map is invalid")
+    return cast("dict[str, SmartSettingsCoordinator]", stored)
 
 
 def _record_length(count: int, stride: int) -> int:

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity import Entity
 
+from homeassistant.const import CONF_HOST
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from pyairtouch import AirTouchModel
@@ -30,13 +31,23 @@ from pyairtouch.at5.comms.hdr import (
 from pyairtouch.at5.comms.x1F_ext import MESSAGE_ID as EXTENDED_MESSAGE_ID
 from pyairtouch.comms.crc16 import Crc16Modbus
 
-from custom_components.airtouch.console import ConsoleClient
-from custom_components.airtouch.const import DOMAIN
+from custom_components.airtouch import (
+    async_setup_entry as async_setup_integration,
+)
+from custom_components.airtouch import (
+    async_unload_entry,
+)
+from custom_components.airtouch.console import DEFAULT_DEADLINE, ConsoleClient
+from custom_components.airtouch.const import CONF_AIRTOUCH_MODEL, DOMAIN
+from custom_components.airtouch.const import AirTouchModel as SelectedModel
 from custom_components.airtouch.smart_settings import (
-    EnergyWastageCoordinator,
+    SmartSettingsCoordinator,
     SmartSettingsParseError,
     SmartSettingsRejectedError,
     SmartSettingsSnapshot,
+    async_install,
+    async_release,
+    get_smart_settings,
     parse_smart_settings,
 )
 from custom_components.airtouch.switch import (
@@ -147,8 +158,8 @@ async def _read_raw(reader: asyncio.StreamReader) -> bytes:
 
 
 class _Entry:
-    def __init__(self) -> None:
-        self.entry_id = "entry"
+    def __init__(self, entry_id: str = "entry") -> None:
+        self.entry_id = entry_id
         self.title = "wastage-test"
         self.domain = DOMAIN
         self.pref_disable_polling = False
@@ -163,6 +174,7 @@ class _Hass:
         self.loop = asyncio.get_running_loop()
         self.config = _Config()
         self.data: dict[str, Any] = {}
+        self.config_entries: Any = None
 
     @property
     def is_stopping(self) -> bool:
@@ -273,6 +285,7 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.silent_eof: list[bytes] = []
         self.closed_during_hold: list[bytes] = []
         self.watch_close = False
+        self.hold_all = False
         self.mode = "ok"
         self.decoy = False
         self.hold_connection = 0
@@ -286,7 +299,7 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.port = sockets[0].getsockname()[1]
         self.hass = _Hass()
         self.entry = _Entry()
-        self.coordinators: list[EnergyWastageCoordinator] = []
+        self.coordinators: list[SmartSettingsCoordinator] = []
 
     async def asyncTearDown(self) -> None:
         self.release.set()
@@ -295,18 +308,20 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.server.close()
         await self.server.wait_closed()
 
-    def _coordinator(self, *, deadline: float = 2.0) -> EnergyWastageCoordinator:
-        coordinator = EnergyWastageCoordinator(
+    def _coordinator(self, *, deadline: float = 2.0) -> SmartSettingsCoordinator:
+        coordinator = async_install(
             cast("Any", self.hass),
             cast("Any", self.entry),
             cast("Any", _AirTouch()),
             port=self.port,
             deadline=deadline,
         )
+        if coordinator is None:
+            raise AssertionError("expected an AirTouch 5 owner")
         self.coordinators.append(coordinator)
         return coordinator
 
-    def _switch(self, coordinator: EnergyWastageCoordinator) -> EnergyWastageSwitch:
+    def _switch(self, coordinator: SmartSettingsCoordinator) -> EnergyWastageSwitch:
         return EnergyWastageSwitch(coordinator, "hub", cast("Any", _DEVICE_INFO))
 
     async def _handle(
@@ -366,7 +381,7 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
-            if self.connections == self.hold_connection:
+            if self.hold_all or self.connections == self.hold_connection:
                 self.started.set()
                 await self.release.wait()
             else:
@@ -401,14 +416,14 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         return self.info
 
     async def test_disabled_weather_differential_blocks_write(self) -> None:
+        coordinator = self._coordinator()
+        switch = self._switch(coordinator)
         for index in (1, 3):
             with self.subTest(differential_index=index):
                 info = bytearray(_SAMPLE_INFO)
                 info[index] = 0xFF
                 self.info = bytes(info)
-                coordinator = self._coordinator()
                 await coordinator.async_refresh()
-                switch = self._switch(coordinator)
                 snapshot = coordinator.data
                 before = len(self.writes)
                 self.assertTrue(switch.available)
@@ -671,6 +686,16 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.mode = "truncate"
         live = _AirTouch()
         self.hass.data[DOMAIN][self.entry.entry_id] = live
+        installed = async_install(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", live),
+            port=self.port,
+        )
+        if installed is None:
+            raise AssertionError("expected an AirTouch 5 owner")
+        self.coordinators.append(installed)
+        seen = self.connections
         with patch(
             "custom_components.airtouch.switch.devices.AirTouchDevice",
             return_value=_Device(),
@@ -678,14 +703,19 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
             await async_setup_entry(
                 cast("Any", self.hass), cast("Any", self.entry), add_entities
             )
+        self.assertEqual(self.connections, seen)
         self.assertEqual(len(added[1]), 1)
-        self.assertFalse(added[1][0].available)
-        self.assertEqual(added[1][0].unique_id, "hub_energy_wastage_detection")
-        self.assertIs(self.hass.data[DOMAIN][self.entry.entry_id], live)
-        self.assertEqual(set(self.hass.data[DOMAIN]), {self.entry.entry_id})
         switch = added[1][0]
         assert isinstance(switch, EnergyWastageSwitch)
-        await switch.coordinator.async_shutdown()
+        self.assertFalse(switch.available)
+        self.assertEqual(switch.unique_id, "hub_energy_wastage_detection")
+        self.assertIs(switch.coordinator, installed)
+        self.assertIs(self.hass.data[DOMAIN][self.entry.entry_id], live)
+        self.assertEqual(set(self.hass.data[DOMAIN]), {self.entry.entry_id})
+        await installed.async_refresh()
+        self.assertGreater(self.connections, seen)
+        self.assertFalse(switch.available)
+        await async_release(cast("Any", self.hass), self.entry.entry_id)
         coordinator = self._coordinator()
         await coordinator.async_refresh()
         self.assertEqual(coordinator.update_interval, timedelta(seconds=60))
@@ -717,6 +747,464 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
             coordinator = self._coordinator()
         self.assertIs(coordinator.config_entry, self.entry)
         self.assertIn(coordinator.async_shutdown, self.entry.unloads)
+
+    async def test_switch_setup_does_not_construct_an_owner(self) -> None:
+        live = _AirTouch()
+        self.hass.data.setdefault(DOMAIN, {})[self.entry.entry_id] = live
+        added: list[list[Entity]] = []
+
+        def add_entities(
+            new_entities: Iterable[Entity],
+            update_before_add: bool = False,  # noqa: FBT001, FBT002
+        ) -> None:
+            del update_before_add
+            added.append(list(new_entities))
+
+        with (
+            patch(
+                "custom_components.airtouch.switch.devices.AirTouchDevice",
+                return_value=_Device(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "not installed"),
+        ):
+            await async_setup_entry(
+                cast("Any", self.hass), cast("Any", self.entry), add_entities
+            )
+        self.assertEqual(added, [])
+        self.assertEqual(self.connections, 0)
+        self.assertIs(self.hass.data[DOMAIN][self.entry.entry_id], live)
+
+    async def test_install_identity_and_airtouch_4(self) -> None:
+        before = self.connections
+        owner = async_install(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if owner is None:
+            raise AssertionError("expected an AirTouch 5 owner")
+        self.coordinators.append(owner)
+        self.assertEqual(self.connections, before)
+        self.assertIs(
+            get_smart_settings(cast("Any", self.hass), self.entry.entry_id), owner
+        )
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            async_install(
+                cast("Any", self.hass),
+                cast("Any", self.entry),
+                cast("Any", _AirTouch()),
+                port=self.port,
+            )
+        self.assertIsNone(
+            async_install(
+                cast("Any", self.hass),
+                cast("Any", _Entry("airtouch-4")),
+                cast("Any", _AirTouch(AirTouchModel.AIRTOUCH_4)),
+                port=self.port,
+            )
+        )
+        self.assertEqual(self.connections, before)
+        api_marker = object()
+        self.hass.data[DOMAIN] = {"lock": object(), self.entry.entry_id: api_marker}
+        self.assertIs(
+            get_smart_settings(cast("Any", self.hass), self.entry.entry_id), owner
+        )
+        self.assertEqual(set(self.hass.data[DOMAIN]), {"lock", self.entry.entry_id})
+        self.assertIs(self.hass.data[DOMAIN][self.entry.entry_id], api_marker)
+
+    async def test_two_entries_release_reload_and_overlap(self) -> None:
+        left_entry = _Entry("left")
+        right_entry = _Entry("right")
+        left = async_install(
+            cast("Any", self.hass),
+            cast("Any", left_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        right = async_install(
+            cast("Any", self.hass),
+            cast("Any", right_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if left is None or right is None:
+            raise AssertionError("expected two owners")
+        self.coordinators.extend((left, right))
+        self.assertIsNot(left, right)
+        self.hass.data[DOMAIN] = {
+            "lock": object(),
+            left_entry.entry_id: object(),
+            right_entry.entry_id: object(),
+        }
+        domain_ids = set(self.hass.data[DOMAIN])
+        await async_release(cast("Any", self.hass), left_entry.entry_id)
+        await async_release(cast("Any", self.hass), left_entry.entry_id)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), left_entry.entry_id)
+        self.assertIs(
+            get_smart_settings(cast("Any", self.hass), right_entry.entry_id), right
+        )
+        self.assertEqual(set(self.hass.data[DOMAIN]), domain_ids)
+        seen = self.connections
+        await left.async_refresh()
+        self.assertEqual(self.connections, seen)
+        await right.async_refresh()
+        self.assertGreater(self.connections, seen)
+        reloaded = async_install(
+            cast("Any", self.hass),
+            cast("Any", left_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if reloaded is None:
+            raise AssertionError("expected a reloaded owner")
+        self.coordinators.append(reloaded)
+        self.assertIsNot(reloaded, left)
+        self.assertIs(
+            get_smart_settings(cast("Any", self.hass), left_entry.entry_id), reloaded
+        )
+        self.assertIs(
+            get_smart_settings(cast("Any", self.hass), right_entry.entry_id), right
+        )
+        self.hold_all = True
+        self.max_active = 0
+        both = asyncio.gather(reloaded.async_refresh(), right.async_refresh())
+        await self._wait_until_active(2)
+        self.assertEqual(self.max_active, 2)
+        self.release.set()
+        await asyncio.wait_for(both, 2)
+
+    async def test_shutdown_drains_admitted_work_and_refuses_late_writes(self) -> None:
+        coordinator = self._coordinator()
+        switch = self._switch(coordinator)
+        await coordinator.async_refresh()
+        self.hold_connection = 2
+        self.watch_close = False
+        admitted = asyncio.create_task(switch.async_turn_on())
+        await asyncio.wait_for(self.started.wait(), 1)
+        queued = asyncio.create_task(switch.async_turn_off())
+        poll = asyncio.create_task(coordinator.async_refresh())
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
+        self.assertFalse(poll.done())
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events, ["query", "query"])
+        closing = asyncio.create_task(
+            async_release(cast("Any", self.hass), self.entry.entry_id)
+        )
+        await asyncio.sleep(0.05)
+        self.assertFalse(admitted.done())
+        self.assertFalse(closing.done())
+        self.release.set()
+        await asyncio.wait_for(admitted, 2)
+        with self.assertRaises(HomeAssistantError):
+            await asyncio.wait_for(queued, 2)
+        await asyncio.wait_for(poll, 2)
+        await asyncio.wait_for(closing, 2)
+        self.assertEqual(self.events, ["query", "query", "write", "query"])
+        self.assertEqual(self.writes[-1].hex(), "ff180a0000a10318031401b1c2d3e4")
+        self.assertEqual(self.max_active, 1)
+        seen = self.connections
+        with self.assertRaises(HomeAssistantError):
+            await switch.async_turn_on()
+        with self.assertRaises(HomeAssistantError):
+            await switch.async_turn_off()
+        self.assertEqual(self.connections, seen)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), self.entry.entry_id)
+
+    async def _wait_until_active(self, count: int) -> None:
+        for _ in range(50):
+            if self.active >= count:
+                return
+            await asyncio.sleep(0.02)
+        self.fail(f"timed out waiting for {count} active connections")
+
+    def _bind_root(self, api: _Api) -> tuple[Any, Any]:
+        def connect(*, model: object, host: str) -> _Api:
+            del model, host
+            return api
+
+        def factory(
+            host: str, port: int, *, deadline: float = DEFAULT_DEADLINE
+        ) -> ConsoleClient:
+            del port
+            return ConsoleClient(host, self.port, deadline=deadline)
+
+        return (
+            patch("custom_components.airtouch.pyairtouch.connect", connect),
+            patch(
+                "custom_components.airtouch.smart_settings.ConsoleClient",
+                factory,
+            ),
+        )
+
+    async def test_setup_orders_install_forward_and_nonfatal_refresh(self) -> None:
+        api = _Api(AirTouchModel.AIRTOUCH_5)
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+        forwarded: list[str] = []
+
+        async def forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            forwarded.append("forward")
+            self.assertEqual(self.connections, 0)
+            owner = get_smart_settings(cast("Any", self.hass), entry.entry_id)
+            self.coordinators.append(owner)
+            self.assertIs(config_entry, entry)
+
+        self.hass.config_entries = _ConfigEntries(forward)
+        connect, client = self._bind_root(api)
+        with connect, client:
+            result = await async_setup_integration(
+                cast("Any", self.hass), cast("Any", entry)
+            )
+        self.assertTrue(result)
+        self.assertEqual(forwarded, ["forward"])
+        self.assertGreater(self.connections, 0)
+        owner = get_smart_settings(cast("Any", self.hass), entry.entry_id)
+        self.assertTrue(owner.last_update_success)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+        stored = owner.data
+        assert stored is not None
+        self.assertEqual(stored.info, _RICH_INFO)
+
+        seen = self.connections
+        self.mode = "truncate"
+        failed_entry = _RootEntry("failed-read", SelectedModel.AIRTOUCH_5.value)
+
+        async def forward_again(config_entry: object, platforms: object) -> None:
+            del config_entry, platforms
+            self.assertEqual(self.connections, seen)
+
+        self.hass.config_entries = _ConfigEntries(forward_again)
+        connect, client = self._bind_root(api)
+        with connect, client:
+            result = await async_setup_integration(
+                cast("Any", self.hass), cast("Any", failed_entry)
+            )
+        self.assertTrue(result)
+        failed = get_smart_settings(cast("Any", self.hass), failed_entry.entry_id)
+        self.coordinators.append(failed)
+        self.assertFalse(failed.last_update_success)
+        self.assertGreater(self.connections, seen)
+
+    async def test_setup_failure_and_cancellation_release_only_the_owner(self) -> None:
+        api = _Api(AirTouchModel.AIRTOUCH_5)
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+
+        async def fail_forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            self.assertIsNotNone(
+                get_smart_settings(
+                    cast("Any", self.hass), cast("Any", config_entry).entry_id
+                )
+            )
+            self.assertEqual(self.connections, 0)
+            raise RuntimeError("forward failed")
+
+        self.hass.config_entries = _ConfigEntries(fail_forward)
+        connect, client = self._bind_root(api)
+        with (
+            connect,
+            client,
+            self.assertRaisesRegex(RuntimeError, "forward failed"),
+        ):
+            await async_setup_integration(cast("Any", self.hass), cast("Any", entry))
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), entry.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+        self.assertEqual(self.connections, 0)
+
+    async def test_release_failure_preserves_the_setup_error(self) -> None:
+        api = _Api(AirTouchModel.AIRTOUCH_5)
+
+        async def fail_forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            self.assertIsNotNone(
+                get_smart_settings(
+                    cast("Any", self.hass), cast("Any", config_entry).entry_id
+                )
+            )
+            raise RuntimeError("forward failed")
+
+        async def bad_release(hass: object, entry_id: str) -> None:
+            del hass, entry_id
+            raise RuntimeError("release failed")
+
+        preserved = _RootEntry("preserved", SelectedModel.AIRTOUCH_5.value)
+        self.hass.config_entries = _ConfigEntries(fail_forward)
+        connect, client = self._bind_root(api)
+        with (
+            connect,
+            client,
+            patch("custom_components.airtouch.async_release", bad_release),
+            self.assertLogs("custom_components.airtouch", level="ERROR") as logged,
+            self.assertRaisesRegex(RuntimeError, "forward failed"),
+        ):
+            await async_setup_integration(
+                cast("Any", self.hass), cast("Any", preserved)
+            )
+        self.assertIn("Error releasing AirTouch smart settings", logged.output[0])
+        self.assertIs(self.hass.data[DOMAIN][preserved.entry_id], api)
+        await async_release(cast("Any", self.hass), preserved.entry_id)
+
+    async def test_setup_cancellation_releases_the_owner(self) -> None:
+        api = _Api(AirTouchModel.AIRTOUCH_5)
+        cancelled = _RootEntry("cancelled", SelectedModel.AIRTOUCH_5.value)
+        started = asyncio.Event()
+
+        async def wait_forward(config_entry: object, platforms: object) -> None:
+            del config_entry, platforms
+            started.set()
+            await asyncio.Event().wait()
+
+        self.hass.config_entries = _ConfigEntries(wait_forward)
+        connect, client = self._bind_root(api)
+        with connect, client:
+            task = asyncio.create_task(
+                async_setup_integration(cast("Any", self.hass), cast("Any", cancelled))
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            self.assertEqual(self.connections, 0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), cancelled.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][cancelled.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+
+        self.hold_connection = 1
+        self.watch_close = True
+        self.settled = asyncio.Event()
+        refresh_entry = _RootEntry("refresh-cancel", SelectedModel.AIRTOUCH_5.value)
+        self.hass.config_entries = _ConfigEntries(None)
+        connect, client = self._bind_root(api)
+        with connect, client:
+            refresh_task = asyncio.create_task(
+                async_setup_integration(
+                    cast("Any", self.hass), cast("Any", refresh_entry)
+                )
+            )
+            await asyncio.wait_for(self.started.wait(), 1)
+            refresh_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await refresh_task
+        self.release.set()
+        await asyncio.wait_for(self.settled.wait(), 2)
+        self.assertEqual(self.closed_during_hold, [b""])
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), refresh_entry.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][refresh_entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+
+    async def test_unload_false_keeps_both_and_success_releases_first(self) -> None:
+        api = _Api(AirTouchModel.AIRTOUCH_5)
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+        self.hass.config_entries = _ConfigEntries(None, unload_ok=False)
+        connect, client = self._bind_root(api)
+        with connect, client:
+            self.assertTrue(
+                await async_setup_integration(
+                    cast("Any", self.hass), cast("Any", entry)
+                )
+            )
+        owner = get_smart_settings(cast("Any", self.hass), entry.entry_id)
+        self.coordinators.append(owner)
+        self.assertFalse(
+            await async_unload_entry(cast("Any", self.hass), cast("Any", entry))
+        )
+        self.assertIs(get_smart_settings(cast("Any", self.hass), entry.entry_id), owner)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+        seen = self.connections
+        await owner.async_refresh()
+        self.assertGreater(self.connections, seen)
+
+        async def tracked_release(hass: object, entry_id: str) -> None:
+            api.events.append("release-start")
+            await async_release(cast("Any", hass), entry_id)
+            api.events.append("release-done")
+
+        self.hass.config_entries.unload_ok = True
+        with patch("custom_components.airtouch.async_release", tracked_release):
+            removed = await async_unload_entry(
+                cast("Any", self.hass), cast("Any", entry)
+            )
+        self.assertTrue(removed)
+        self.assertEqual(api.events, ["release-start", "release-done", "api-shutdown"])
+        self.assertNotIn(entry.entry_id, self.hass.data[DOMAIN])
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), entry.entry_id)
+
+        fourth = _Api(AirTouchModel.AIRTOUCH_4)
+        at4 = _RootEntry("at4", SelectedModel.AIRTOUCH_4.value)
+        seen = self.connections
+        self.hass.config_entries = _ConfigEntries(None)
+        connect, client = self._bind_root(fourth)
+        with connect, client:
+            self.assertTrue(
+                await async_setup_integration(cast("Any", self.hass), cast("Any", at4))
+            )
+        self.assertEqual(self.connections, seen)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), at4.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][at4.entry_id], fourth)
+
+
+class _Api:
+    def __init__(self, model: AirTouchModel) -> None:
+        self.model = model
+        self.host = "127.0.0.1"
+        self.shutdown_calls = 0
+        self.events: list[str] = []
+
+    async def init(self) -> bool:
+        return True
+
+    async def shutdown(self) -> None:
+        self.events.append("api-shutdown")
+        self.shutdown_calls += 1
+
+
+class _RootEntry:
+    def __init__(self, entry_id: str, model: str) -> None:
+        self.entry_id = entry_id
+        self.title = "root"
+        self.domain = DOMAIN
+        self.version = 2
+        self.minor_version = 2
+        self.unique_id = entry_id
+        self.data = {CONF_HOST: "127.0.0.1", CONF_AIRTOUCH_MODEL: model}
+        self.pref_disable_polling = False
+        self.unloads: list[Any] = []
+
+    def async_on_unload(self, func: Callable[[], object]) -> None:
+        self.unloads.append(func)
+
+
+class _ConfigEntries:
+    def __init__(
+        self,
+        forward: Callable[[object, object], Any] | None,
+        *,
+        unload_ok: bool = True,
+    ) -> None:
+        self._forward = forward
+        self.unload_ok = unload_ok
+
+    async def async_forward_entry_setups(
+        self, entry: object, platforms: object
+    ) -> None:
+        if self._forward is not None:
+            await self._forward(entry, platforms)
+
+    async def async_unload_platforms(self, entry: object, platforms: object) -> bool:
+        del entry, platforms
+        return self.unload_ok
 
 
 class WastageMetadataTests(unittest.TestCase):

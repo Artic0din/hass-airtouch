@@ -16,10 +16,11 @@ if TYPE_CHECKING:
 from . import devices
 from .const import DOMAIN
 from .smart_settings import (
-    EnergyWastageCoordinator,
+    SmartSettingsCoordinator,
     SmartSettingsExchangeError,
     SmartSettingsRejectedError,
     SmartSettingsSnapshot,
+    get_smart_settings,
 )
 
 
@@ -59,19 +60,18 @@ async def async_collect_energy_wastage_switches(
     """
     if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
         return []
-    coordinator = EnergyWastageCoordinator(hass, config_entry, airtouch)
-    await coordinator.async_refresh()
+    coordinator = get_smart_settings(hass, config_entry.entry_id)
     return [EnergyWastageSwitch(coordinator, unique_id, device_info)]
 
 
-class EnergyWastageSwitch(CoordinatorEntity[EnergyWastageCoordinator], SwitchEntity):
+class EnergyWastageSwitch(CoordinatorEntity[SmartSettingsCoordinator], SwitchEntity):
     _attr_has_entity_name = True
     _attr_translation_key = "energy_wastage_detection"
     _attr_name = "Energy wastage detection"
 
     def __init__(
         self,
-        coordinator: EnergyWastageCoordinator,
+        coordinator: SmartSettingsCoordinator,
         unique_id: str,
         device_info: DeviceInfo,
     ) -> None:
