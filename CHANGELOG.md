@@ -10,6 +10,7 @@
 - Added AirTouch 5 weather-adaptation switches and differential and comfort numbers on the console.
 - Added per-air-conditioner cool and heat limits and an auto-off duration for AirTouch 5.
 - Added AirTouch 5 console numbers for the home alert minimum and maximum.
+- Added AirTouch 5 relay output switches for Toggle outputs and buttons for Pulse outputs.
 
 ### Fixed
 

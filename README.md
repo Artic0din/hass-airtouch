@@ -411,6 +411,51 @@ A failed read while Home Assistant is setting up these entities does not stop th
 
 </details>
 
+### Switches and buttons for relay outputs
+An AirTouch 5 console can drive up to eight auxiliary relay outputs.
+The installer sets each output to Toggle, Pulse, or Not Used on the console.
+AirTouch 4 consoles do not get these entities.
+
+A Toggle output is a [**switch**][hass-switch].
+On means the console reports the contact closed, and off means open.
+A Pulse output is a [**button**][hass-button].
+Pressing it asks the console for one pulse of the length the installer set.
+A press does not report whether the contact actually closed.
+Not Used outputs, unknown output types, and inputs get no entities.
+Each entity uses the output's name from the console when the console sends one, and `Output 1` to `Output 8` otherwise.
+
+Every switch change and button press reads the outputs again first.
+If the output is no longer that type, nothing is sent and Home Assistant reports an error.
+A switch already in the requested state sends nothing.
+Otherwise the integration sends one command, then reads the outputs up to three times with half-second pauses until the switch shows the new state.
+Outputs that the installer grouped can change together, and every switch shows what the console reports.
+A command is never sent again automatically.
+If the connection fails after a command was sent, the command may still have taken effect, and the relay entities stay unavailable until the next successful read.
+The readback timing has not been measured on a console with configured outputs, so a slow console can report an error for a change that shows up at the next read.
+
+The integration reads the outputs about once a minute on its own short connection.
+A newly configured output gets its entity after the next read, without reloading the integration.
+If the installer changes an output's type, the old entity becomes unavailable and an entity for the new type appears.
+Home Assistant keeps the old entity and its settings, so you can delete it when it is no longer needed.
+Climate entities keep using the main console connection, and a failed output read does not stop them from loading.
+
+`switch.<console_name>_<output_name>`
+`button.<console_name>_<output_name>`
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `on` | The console reports the Toggle output closed.
+ `off` | The console reports the Toggle output open.
+ `<timestamp>` | The button was last pressed from Home Assistant at this time.
+ `unknown` | The button has not been pressed from Home Assistant.
+ `unavailable` | The output is now another type or not used, the latest read failed, or a command's result is uncertain.
+
+</details>
+
 ### :thermometer: Numbers: Air conditioner limits
 Each AirTouch 5 air conditioner gets five [**number**][hass-number] entities for its cool and heat limits and its auto-off duration.
 AirTouch 4 air conditioners do not get these numbers.
@@ -610,6 +655,7 @@ If you would like to make a donation as appreciation of my work:
 [commits]: https://github.com/thenoctambulist/hass-airtouch/commits/main
 [hacs-shield]: https://img.shields.io/badge/HACS-Default-blue.svg
 [hass-binary]: https://www.home-assistant.io/integrations/binary_sensor/
+[hass-button]: https://www.home-assistant.io/integrations/button/
 [hass-climate]: https://www.home-assistant.io/integrations/climate/
 [hass-cover]: https://www.home-assistant.io/integrations/cover/
 [hass-customizing-entities]: https://www.home-assistant.io/docs/configuration/customizing-devices/

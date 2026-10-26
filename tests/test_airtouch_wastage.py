@@ -47,6 +47,10 @@ from custom_components.airtouch import (
 from custom_components.airtouch.console import DEFAULT_DEADLINE, ConsoleClient
 from custom_components.airtouch.const import CONF_AIRTOUCH_MODEL, DOMAIN
 from custom_components.airtouch.const import AirTouchModel as SelectedModel
+from custom_components.airtouch.io_outputs import (
+    async_install_io_outputs,
+    async_release_io_outputs,
+)
 from custom_components.airtouch.number import SmartSettingNumber
 from custom_components.airtouch.smart_settings import (
     SmartFlag,
@@ -317,6 +321,11 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.hass = _Hass()
         self.entry = _Entry()
         self.coordinators: list[SmartSettingsCoordinator] = []
+        io_client = patch(
+            "custom_components.airtouch.io_outputs.ConsoleClient", self._io_client
+        )
+        io_client.start()
+        self.addCleanup(io_client.stop)
 
     async def asyncTearDown(self) -> None:
         self.release.set()
@@ -324,6 +333,12 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.async_shutdown()
         self.server.close()
         await self.server.wait_closed()
+
+    def _io_client(
+        self, host: str, port: int, *, deadline: float = DEFAULT_DEADLINE
+    ) -> ConsoleClient:
+        del port
+        return ConsoleClient(host, self.port, deadline=deadline)
 
     def _coordinator(self, *, deadline: float = 2.0) -> SmartSettingsCoordinator:
         coordinator = async_install(
@@ -724,6 +739,17 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         if installed is None:
             raise AssertionError("expected an AirTouch 5 owner")
         self.coordinators.append(installed)
+        outputs = async_install_io_outputs(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", live),
+            port=self.port,
+        )
+        if outputs is None:
+            raise AssertionError("expected an AirTouch 5 output owner")
+        self.addAsyncCleanup(
+            async_release_io_outputs, cast("Any", self.hass), self.entry.entry_id
+        )
         seen = self.connections
         with patch(
             "custom_components.airtouch.switch.devices.AirTouchDevice",

@@ -15,6 +15,12 @@ if TYPE_CHECKING:
 
 from . import devices
 from .const import DOMAIN
+from .io_outputs import (
+    IoOutputEntity,
+    IoOutputsCoordinator,
+    ToggleOutput,
+    get_io_outputs,
+)
 from .smart_settings import (
     SmartFlag,
     SmartSettingsCoordinator,
@@ -42,13 +48,26 @@ async def async_setup_entry(
         async_add_entities([])
         return
     device = devices.AirTouchDevice(hass, config_entry.entry_id, airtouch)
-    async_add_entities(
-        await async_collect_smart_setting_switches(
-            hass,
-            config_entry,
-            airtouch,
-            unique_id=device.unique_id,
-            device_info=device.device_info,
+    smart_switches = await async_collect_smart_setting_switches(
+        hass,
+        config_entry,
+        airtouch,
+        unique_id=device.unique_id,
+        device_info=device.device_info,
+    )
+    outputs = get_io_outputs(hass, config_entry.entry_id)
+    async_add_entities(smart_switches)
+    config_entry.async_on_unload(
+        outputs.async_add_discovery(
+            ToggleOutput,
+            lambda channels: async_add_entities(
+                [
+                    RelayOutputSwitch(
+                        outputs, device.unique_id, device.device_info, channel
+                    )
+                    for channel in channels
+                ]
+            ),
         )
     )
 
@@ -127,3 +146,29 @@ class SmartSettingSwitch(CoordinatorEntity[SmartSettingsCoordinator], SwitchEnti
             await self.coordinator.async_set_flag(self._field, enabled=enabled)
         except (SmartSettingsRejectedError, SmartSettingsExchangeError) as err:
             raise HomeAssistantError(str(err)) from err
+
+
+class RelayOutputSwitch(IoOutputEntity, SwitchEntity):
+    """A toggle output. On means the console reports the contact closed."""
+
+    def __init__(
+        self,
+        coordinator: IoOutputsCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+        channel: int,
+    ) -> None:
+        super().__init__(coordinator, ToggleOutput, unique_id, device_info, channel)
+
+    @property
+    def is_on(self) -> bool | None:
+        output = self._current() if self.available else None
+        return output.closed if isinstance(output, ToggleOutput) else None
+
+    async def async_turn_on(self, **kwargs: object) -> None:
+        del kwargs
+        await self._act(self.coordinator.async_set_closed(self._channel, closed=True))
+
+    async def async_turn_off(self, **kwargs: object) -> None:
+        del kwargs
+        await self._act(self.coordinator.async_set_closed(self._channel, closed=False))
