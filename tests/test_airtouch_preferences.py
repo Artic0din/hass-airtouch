@@ -5,21 +5,25 @@ import contextlib
 import struct
 import unittest
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from logging import Logger
 
+    from homeassistant.components.number import NumberEntity
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity import Entity
 
+from homeassistant.components import number as number_component
 from homeassistant.components.number import NumberDeviceClass, NumberMode
 from homeassistant.const import UnitOfTemperature
+from homeassistant.core import ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util.unit_conversion import TemperatureConverter
+from homeassistant.util.unit_system import METRIC_SYSTEM, US_CUSTOMARY_SYSTEM
 from pyairtouch import AirTouchModel
 from pyairtouch.at5.comms.hdr import At5Header, HeaderDecoder, HeaderEncoder
 from pyairtouch.at5.comms.xC0_ctrl_status import MESSAGE_ID as CONTROL_MESSAGE_ID
@@ -173,6 +177,7 @@ class _Hass:
 class _Config:
     def __init__(self) -> None:
         self.time_zone = "UTC"
+        self.units = METRIC_SYSTEM
 
 
 class _AirTouch:
@@ -193,6 +198,12 @@ class _Device:
 
     def __init__(self) -> None:
         self.device_info = _DEVICE_INFO
+
+
+class _NumberServiceModule(Protocol):
+    async def async_set_value(
+        self, entity: NumberEntity, service_call: ServiceCall
+    ) -> None: ...
 
 
 class PreferenceReportTests(unittest.TestCase):
@@ -272,12 +283,16 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
     def _numbers(
         self, coordinator: PreferenceCoordinator
     ) -> dict[PreferenceField, PreferenceNumber]:
-        return {
+        numbers = {
             field: PreferenceNumber(
                 coordinator, "hub", cast("Any", _DEVICE_INFO), field
             )
             for field in PreferenceField
         }
+        for field, number in numbers.items():
+            number.hass = cast("HomeAssistant", self.hass)
+            number.entity_id = f"number.{field.name.lower()}"
+        return numbers
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -420,6 +435,130 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HomeAssistantError):
                 await number.async_set_native_value(value)
         self.assertEqual(self.connections, before)
+
+    async def test_displayed_temperature_values_bounds_and_steps(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        numbers = self._numbers(coordinator)
+        cases = (
+            (PreferenceField.SLEEP_COOL, 32, 16, 32, 89.6, 60.8, 89.6),
+            (PreferenceField.SLEEP_HEAT, 16, 16, 31, 60.8, 60.8, 87.9),
+            (PreferenceField.AWAY_MINIMUM, 18, 0, 50, 64.4, 32, 122),
+            (PreferenceField.AWAY_MAXIMUM, 28, 0, 50, 82.4, 32, 122),
+        )
+        for field, value_c, low_c, high_c, value_f, low_f, high_f in cases:
+            number = numbers[field]
+            with self.subTest(field=field):
+                self.hass.config.units = METRIC_SYSTEM
+                self.assertEqual(number.unit_of_measurement, UnitOfTemperature.CELSIUS)
+                self.assertEqual(number.step, 1.0)
+                self.assertEqual(number.value, value_c)
+                self.assertEqual((number.min_value, number.max_value), (low_c, high_c))
+                self.hass.config.units = US_CUSTOMARY_SYSTEM
+                self.assertEqual(
+                    number.unit_of_measurement, UnitOfTemperature.FAHRENHEIT
+                )
+                self.assertEqual(number.step, 1.8)
+                self.assertEqual(number.value, value_f)
+                self.assertEqual((number.min_value, number.max_value), (low_f, high_f))
+                self.assertEqual(number.native_value, value_c)
+                self.assertEqual(
+                    (number.native_min_value, number.native_max_value), (low_c, high_c)
+                )
+                self.assertEqual(
+                    number.native_unit_of_measurement, UnitOfTemperature.CELSIUS
+                )
+                self.assertEqual(number.unique_id, f"hub_{field.name.lower()}")
+
+    async def test_step_tracks_entity_unit_overrides_and_later_changes(self) -> None:
+        numbers = self._numbers(self._coordinator())
+        for field, number in numbers.items():
+            with self.subTest(field=field):
+                self.assertEqual(number.step, 1.0)
+                with patch.object(
+                    number,
+                    "_number_option_unit_of_measurement",
+                    UnitOfTemperature.FAHRENHEIT,
+                ):
+                    self.assertEqual(number.step, 1.8)
+                self.assertEqual(number.step, 1.0)
+                self.hass.config.units = US_CUSTOMARY_SYSTEM
+                self.assertEqual(number.step, 1.8)
+                with patch.object(
+                    number,
+                    "_number_option_unit_of_measurement",
+                    UnitOfTemperature.CELSIUS,
+                ):
+                    self.assertEqual(number.step, 1.0)
+                self.assertEqual(number.step, 1.8)
+                self.hass.config.units = METRIC_SYSTEM
+                self.assertEqual(number.step, 1.0)
+
+    async def test_advertised_fahrenheit_step_works_through_number_service(
+        self,
+    ) -> None:
+        prefix = bytearray(self.prefix)
+        prefix[20:24] = bytes((21, 21, 21, 21))
+        self.prefix = bytes(prefix)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        self.hass.config.units = US_CUSTOMARY_SYSTEM
+        numbers = self._numbers(coordinator)
+        for field, offset in (
+            (PreferenceField.SLEEP_COOL, 22),
+            (PreferenceField.SLEEP_HEAT, 23),
+            (PreferenceField.AWAY_MAXIMUM, 20),
+            (PreferenceField.AWAY_MINIMUM, 21),
+        ):
+            with self.subTest(field=field):
+                number = numbers[field]
+                self.assertEqual(number.step, 1.8)
+                self.assertEqual(number.value, 69.8)
+                assert number.value is not None
+                before = len(self.writes)
+                await cast("_NumberServiceModule", number_component).async_set_value(
+                    number,
+                    ServiceCall(
+                        cast("HomeAssistant", self.hass),
+                        "number",
+                        "set_value",
+                        {"value": number.value + number.step},
+                    ),
+                )
+                prefix[offset] = 22
+                self.assertEqual(len(self.writes), before + 1)
+                self.assertEqual(self.writes[-1], bytes(prefix))
+                self.assertEqual(number.native_value, 22)
+                self.assertEqual(number.value, 71.6)
+                snapshot = coordinator.data
+                assert snapshot is not None
+                self.assertEqual(snapshot.value(field), 22)
+
+    async def test_number_service_keeps_fractional_and_range_rejections(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        self.hass.config.units = US_CUSTOMARY_SYSTEM
+        before = self.connections
+        for field, number in self._numbers(coordinator).items():
+            for value in (70.8, number.min_value - 1.8, number.max_value + 1.8):
+                with (
+                    self.subTest(field=field, value=value),
+                    self.assertRaises(HomeAssistantError),
+                ):
+                    await cast(
+                        "_NumberServiceModule", number_component
+                    ).async_set_value(
+                        number,
+                        ServiceCall(
+                            cast("HomeAssistant", self.hass),
+                            "number",
+                            "set_value",
+                            {"value": value},
+                        ),
+                    )
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.prefix, _console_prefix())
 
     async def test_bounds_and_rejected_values_do_not_write(self) -> None:
         coordinator = self._coordinator()

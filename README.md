@@ -295,6 +295,7 @@ Sleep cool is 16–32°C and sleep heat is 16–31°C, in whole degrees.
 The console's five-bit sleep-heat decoder reads an encoded 32°C as 16°C, so this integration rejects that value.
 Away minimum and away maximum are whole degrees from 0 to 50.
 Away minimum has to stay at or below away maximum.
+Home Assistant displays these targets in the entity's selected temperature unit, with increments of 1°C or 1.8°F.
 The integration reads the console preference, changes only that temperature, and checks the console stored it.
 The other preference bytes stay as they were.
 A failed change leaves the previous number in place.
@@ -313,7 +314,7 @@ Climate entities keep using the main console connection.
 #### States
  State | Description
 -------|-------------
- `<value>` | The temperature in °C.
+ `<value>` | The temperature in the entity's selected unit, °C or °F.
  `unavailable` | The latest preference read failed.
 
 </details>

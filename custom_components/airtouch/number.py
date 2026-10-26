@@ -39,6 +39,9 @@ _SPECS: Final = {
     PreferenceField.AWAY_MAXIMUM: _FieldSpec("away_maximum", "Away maximum"),
 }
 
+_CELSIUS_STEP: Final = 1.0
+_FAHRENHEIT_STEP: Final = 1.8
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -88,7 +91,6 @@ class PreferenceNumber(CoordinatorEntity[PreferenceCoordinator], NumberEntity):
     _attr_has_entity_name = True
     _attr_device_class = NumberDeviceClass.TEMPERATURE
     _attr_mode = NumberMode.BOX
-    _attr_native_step = 1.0
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
 
     def __init__(
@@ -108,6 +110,13 @@ class PreferenceNumber(CoordinatorEntity[PreferenceCoordinator], NumberEntity):
         minimum, maximum = PREFERENCE_LIMITS[field]
         self._attr_native_min_value = float(minimum)
         self._attr_native_max_value = float(maximum)
+
+    @property
+    def native_step(self) -> float:
+        # HA converts display temperatures but leaves native_step unchanged.
+        if self.unit_of_measurement == UnitOfTemperature.FAHRENHEIT:
+            return _FAHRENHEIT_STEP
+        return _CELSIUS_STEP
 
     @property
     def available(self) -> bool:
