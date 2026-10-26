@@ -249,6 +249,42 @@ A [**sensor**][hass-sensor] is created for each air-conditioner to publish any r
 
 </details>
 
+### :timer_clock: Sensor: Run time today (`sensor.<name>_run_time_today`)
+On an AirTouch 5, a duration sensor is created for each air conditioner and each zone.
+The state is today's total run time in minutes. Home Assistant records that state from the time the sensor exists.
+The console's stored history for the current month and for today's hours is on the sensor attributes.
+
+AirTouch 4 consoles do not serve this history, so these sensors are not created for an AirTouch 4.
+
+Daily figures use the console's 6-minute units. A daily value can sit a few minutes away from the sum of that day's hourly minutes.
+Hourly figures are whole minutes. The sensors report minutes and leave energy estimation to a separate calculation.
+
+The integration reads the console about every 15 minutes on its own short connection.
+When a read fails, these sensors become unavailable until the next successful read. Climate entities keep using the main console connection.
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State     | Description
+-----------|-------------
+ `<minutes>` | Today's run time in minutes. The state uses the console's daily total, so it follows the 6-minute approximation.
+ `unknown` | The console has no stored record for today.
+ `unavailable` | The latest history read failed, or the stored report is from a previous local date.
+
+#### Attributes
+ Attribute | Description
+-----------|-------------
+ `daily_minute_resolution` | `6`. Daily minute values are `stored units × 6`.
+ `hourly_minute_resolution` | `1`.
+ `daily_runtime_is_approximate` | `true`.
+ `local_date` | The Home Assistant local date the report was read for.
+ `mode_breakdown` | Air conditioner only. Today's cool, heat, fan, dry, away, sleep, and weather-adapt minutes, plus `average_setpoint_c` when the console stored one.
+ `daily` | Days from the 1st through today. A day the console did not store is null, including a future or impossible day number such as the 31st of a short month. An air conditioner omitted from a stored day ran for 0 minutes.
+ `hourly` | Hours from midnight through the current hour. A missing hour is null.
+
+</details>
+
 ### :battery: Binary Sensor: Battery (`binary_sensor.<zone_name>_battery`)
 A [**binary sensor**][hass-binary] is created for each zone with a temperature sensor to represent the battery state.
 

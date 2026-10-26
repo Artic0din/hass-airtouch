@@ -120,6 +120,12 @@
             }
           }
         }
+      },
+      "ac_run_time_today": {
+        "name": "Run time today"
+      },
+      "zone_run_time_today": {
+        "name": "Run time today"
       }
     }
   },
