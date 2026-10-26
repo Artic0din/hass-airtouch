@@ -36,6 +36,12 @@
       "away_maximum": {
         "default": "mdi:thermometer-high"
       },
+      "alert_minimum": {
+        "default": "mdi:thermometer-alert"
+      },
+      "alert_maximum": {
+        "default": "mdi:home-alert"
+      },
       "weather_adaptation_cool_differential": {
         "default": "mdi:thermometer-minus"
       },

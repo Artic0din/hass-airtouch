@@ -20,6 +20,7 @@ from .const import (
     DOMAIN,
     AirTouchModel,
 )
+from .preferences import async_install_preferences, async_release_preferences
 from .smart_settings import async_install, async_release
 
 if TYPE_CHECKING:
@@ -97,32 +98,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # HA skips unload callbacks on generic setup failure or cancellation.
     owner = async_install(hass, entry, airtouch)
     try:
+        async_install_preferences(hass, entry, airtouch)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         if owner is not None:
             await owner.async_refresh()
     except BaseException:
-        try:
-            await async_release_ac_settings(hass, entry.entry_id)
-        except Exception:
-            _LOGGER.exception(
-                "Error releasing AirTouch AC settings after setup failure"
-            )
-        if owner is not None:
-            try:
-                await async_release(hass, entry.entry_id)
-            except Exception:
-                _LOGGER.exception(
-                    "Error releasing AirTouch smart settings after setup failure"
-                )
+        await _async_release_after_setup_failure(
+            hass, entry.entry_id, release_smart=owner is not None
+        )
         raise
 
     return True
+
+
+async def _async_release_after_setup_failure(
+    hass: HomeAssistant, entry_id: str, *, release_smart: bool
+) -> None:
+    try:
+        await async_release_ac_settings(hass, entry_id)
+    except Exception:
+        _LOGGER.exception("Error releasing AirTouch AC settings after setup failure")
+    try:
+        await async_release_preferences(hass, entry_id)
+    except Exception:
+        _LOGGER.exception("Error releasing AirTouch preferences after setup failure")
+    if release_smart:
+        try:
+            await async_release(hass, entry_id)
+        except Exception:
+            _LOGGER.exception(
+                "Error releasing AirTouch smart settings after setup failure"
+            )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await async_release_ac_settings(hass, entry.entry_id)
+        await async_release_preferences(hass, entry.entry_id)
         await async_release(hass, entry.entry_id)
         airtouch: pyairtouch.AirTouch = hass.data[DOMAIN].pop(entry.entry_id)
         if airtouch:

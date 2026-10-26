@@ -319,6 +319,39 @@ Climate entities keep using the main console connection.
 
 </details>
 
+### :thermometer: Number: Home alert thresholds
+An AirTouch 5 console gets two more [**number**][hass-number] entities for the home temperature alert.
+They belong to the console, not to an individual air conditioner.
+AirTouch 4 consoles do not get these entities.
+Each threshold is a whole number from 0 to 50°C.
+Home Assistant displays it in the entity's selected temperature unit, with increments of 1°C or 1.8°F.
+A disabled threshold is unknown.
+Zero is a real threshold.
+Setting a temperature turns that threshold on.
+Turning a threshold off is done on the AirTouch console.
+The integration does not add a switch for that.
+When both thresholds are on, the minimum has to stay at or below the maximum.
+A disabled partner does not limit the other value.
+The integration reads the console preference, changes only that temperature, and checks the console stored it.
+The console's own alert is not available on the local connection these numbers use.
+The console averages the temperatures it can see, limits how often it sends, and delivers that alert on its own cloud path.
+This integration does not emit a Home Assistant event for that alert.
+
+`number.<console_name>_alert_minimum`
+`number.<console_name>_alert_maximum`
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `<value>` | The temperature in the entity's selected unit, °C or °F.
+ `unknown` | That threshold is turned off on the console.
+ `unavailable` | The latest preference read failed.
+
+</details>
+
 ### :window: Switches: Weather adaptation and energy wastage
 An AirTouch 5 console gets four [**switches**][hass-switch] for weather adaptation and energy wastage detection.
 They belong to the console, not to an individual air conditioner.

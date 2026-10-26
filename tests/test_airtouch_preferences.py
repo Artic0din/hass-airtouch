@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import struct
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
@@ -29,7 +31,16 @@ from pyairtouch.at5.comms.hdr import At5Header, HeaderDecoder, HeaderEncoder
 from pyairtouch.at5.comms.xC0_ctrl_status import MESSAGE_ID as CONTROL_MESSAGE_ID
 from pyairtouch.comms.crc16 import Crc16Modbus
 
+from custom_components.airtouch import (
+    async_setup_entry as async_setup_integration,
+)
+from custom_components.airtouch import (
+    async_unload_entry as async_unload_integration,
+)
+from custom_components.airtouch import climate
+from custom_components.airtouch.console import DEFAULT_DEADLINE, ConsoleClient
 from custom_components.airtouch.const import DOMAIN
+from custom_components.airtouch.const import AirTouchModel as SelectedModel
 from custom_components.airtouch.number import (
     PreferenceNumber,
     async_collect_preference_numbers,
@@ -41,10 +52,17 @@ from custom_components.airtouch.preferences import (
     PreferenceParseError,
     PreferenceRejectedError,
     PreferenceSnapshot,
+    async_install_preferences,
+    async_release_preferences,
+    get_preferences,
     parse_preference_report,
     whole_degrees,
 )
-from custom_components.airtouch.smart_settings import async_install, async_release
+from custom_components.airtouch.smart_settings import (
+    async_install,
+    async_release,
+    get_smart_settings,
+)
 
 _OUTER = b"\x55\x55\x55\xab"
 _ENCODER = HeaderEncoder()
@@ -170,6 +188,7 @@ class _Hass:
         self.loop = asyncio.get_running_loop()
         self.config = _Config()
         self.data: dict[str, Any] = {}
+        self.config_entries: Any = None
 
     @property
     def is_stopping(self) -> bool:
@@ -200,6 +219,104 @@ class _Device:
 
     def __init__(self) -> None:
         self.device_info = _DEVICE_INFO
+
+
+class _Api:
+    def __init__(self, model: AirTouchModel = AirTouchModel.AIRTOUCH_5) -> None:
+        self.model = model
+        self.host = "127.0.0.1"
+        self.shutdown_calls = 0
+        self.connected = True
+        self.air_conditioners: list[Any] = []
+
+    async def init(self) -> bool:
+        return True
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        self.connected = False
+
+
+class _RootEntry:
+    def __init__(self, entry_id: str, model: str) -> None:
+        self.entry_id = entry_id
+        self.title = "preference-root"
+        self.domain = DOMAIN
+        self.version = 2
+        self.minor_version = 2
+        self.unique_id = entry_id
+        self.data = {"host": "127.0.0.1", "airtouch_model": model}
+        self.options: dict[str, Any] = {}
+        self.pref_disable_polling = False
+        self.unloads: list[Any] = []
+        self.listeners: list[Any] = []
+
+    def async_on_unload(self, func: Callable[[], object]) -> None:
+        self.unloads.append(func)
+
+    def add_update_listener(self, listener: object) -> Callable[[], None]:
+        self.listeners.append(listener)
+        return lambda: None
+
+
+class _ConfigEntries:
+    def __init__(
+        self,
+        forward: Callable[[object, object], Any] | None,
+        *,
+        unload_ok: bool = True,
+    ) -> None:
+        self._forward = forward
+        self.unload_ok = unload_ok
+
+    async def async_forward_entry_setups(
+        self, entry: object, platforms: object
+    ) -> None:
+        if self._forward is not None:
+            await self._forward(entry, platforms)
+
+    async def async_unload_platforms(self, entry: object, platforms: object) -> bool:
+        del entry, platforms
+        return self.unload_ok
+
+
+class _Ac:
+    def __init__(self, ac_id: int, name: str) -> None:
+        self.ac_id = ac_id
+        self.name = name
+        self.zones: list[object] = []
+        self.supported_modes: list[object] = []
+        self.supported_fan_speeds: list[object] = []
+        self.supported_power_controls: list[object] = []
+        self.target_temperature_resolution = 1.0
+
+    def subscribe_ac_state(self, callback: object) -> None:
+        del callback
+
+    def unsubscribe_ac_state(self, callback: object) -> None:
+        del callback
+
+
+class _AcDevice:
+    def __init__(self, ac: _Ac) -> None:
+        self.unique_id = f"hub_ac{ac.ac_id}"
+        self.device_info = {
+            "identifiers": {("airtouch", self.unique_id)},
+            "name": ac.name,
+        }
+
+
+class _Console:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def ac_device(self, ac: _Ac) -> _AcDevice:
+        return _AcDevice(ac)
+
+
+class _Platform:
+    def async_register_entity_service(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
 
 
 class _NumberServiceModule(Protocol):
@@ -239,6 +356,62 @@ class PreferenceReportTests(unittest.TestCase):
         decoded_mask = parse_preference_report(_report(bytes(masked)))
         self.assertEqual(decoded_mask.sleep_cool_c, 32)
 
+    def test_enabled_zero_is_distinct_from_disabled_lower_bits(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 0x80
+        prefix[19] = 0x32
+        report = parse_preference_report(_report(bytes(prefix)))
+        self.assertEqual(report.alert_maximum_c, 0)
+        self.assertIsNone(report.alert_minimum_c)
+        self.assertEqual(report.value(PreferenceField.ALERT_MAXIMUM), 0)
+        self.assertIsNone(report.value(PreferenceField.ALERT_MINIMUM))
+        self.assertEqual(report.away_maximum_c, 28)
+        self.assertEqual(report.sleep_cool_c, 32)
+        disabled = bytearray(prefix)
+        disabled[18] = 0x7F
+        disabled[19] = 0x00
+        hidden = parse_preference_report(_report(bytes(disabled)))
+        self.assertIsNone(hidden.alert_maximum_c)
+        self.assertIsNone(hidden.alert_minimum_c)
+        enabled_limit = bytearray(prefix)
+        enabled_limit[18] = 50 | 0x80
+        enabled_limit[19] = 0x80
+        decoded = parse_preference_report(_report(bytes(enabled_limit)))
+        self.assertEqual(decoded.alert_maximum_c, 50)
+        self.assertEqual(decoded.alert_minimum_c, 0)
+
+    def test_alert_metadata_matches_translations_icons_and_docs(self) -> None:
+        root = Path(__file__).parents[1]
+        strings = json.loads(
+            (root / "custom_components/airtouch/strings.json").read_text()
+        )
+        english = json.loads(
+            (root / "custom_components/airtouch/translations/en.json").read_text()
+        )
+        icons = json.loads((root / "custom_components/airtouch/icons.json").read_text())
+        self.assertEqual(strings["entity"], english["entity"])
+        expected = {
+            "alert_minimum": ("Alert minimum", "mdi:thermometer-alert"),
+            "alert_maximum": ("Alert maximum", "mdi:home-alert"),
+        }
+        for key, (name, icon) in expected.items():
+            self.assertEqual(strings["entity"]["number"][key]["name"], name)
+            self.assertEqual(icons["entity"]["number"][key]["default"], icon)
+        changelog = (root / "CHANGELOG.md").read_text()
+        readme = (root / "README.md").read_text()
+        self.assertIn(
+            "Added AirTouch 5 console numbers for the home alert minimum and maximum.",
+            changelog,
+        )
+        self.assertIn(
+            "Turning a threshold off is done on the AirTouch console.",
+            readme,
+        )
+        self.assertIn(
+            "This integration does not emit a Home Assistant event for that alert.",
+            readme,
+        )
+
     def test_truncated_and_unexpected_reports_fail(self) -> None:
         with self.assertRaises(PreferenceParseError):
             parse_preference_report(b"\x45\x00\x00\x34")
@@ -261,6 +434,7 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         self.mode = "ok"
         self.decoy = False
         self.hold_once = False
+        self.hold_all = False
         self._held = False
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -338,8 +512,9 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
-            if self.hold_once and not self._held:
-                self._held = True
+            if self.hold_all or (self.hold_once and not self._held):
+                if not self.hold_all:
+                    self._held = True
                 self.started.set()
                 await self.release.wait()
             else:
@@ -601,6 +776,173 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PreferenceRejectedError):
             await coordinator.async_set(PreferenceField.AWAY_MINIMUM, True)  # noqa: FBT003
 
+    def _assert_one_byte(self, before: bytes, index: int, value: int) -> None:
+        written = self.writes[-1]
+        self.assertEqual(len(written), 32)
+        self.assertEqual(written[index], value)
+        for offset, byte in enumerate(before):
+            if offset != index:
+                self.assertEqual(written[offset], byte)
+
+    async def test_alert_writes_keep_every_other_preference_byte(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        numbers = self._numbers(coordinator)
+        maximum = numbers[PreferenceField.ALERT_MAXIMUM]
+        minimum = numbers[PreferenceField.ALERT_MINIMUM]
+        self.assertTrue(maximum.available)
+        self.assertIsNone(maximum.native_value)
+        self.assertIsNone(minimum.native_value)
+        before = self.prefix
+        await maximum.async_set_native_value(26)
+        self._assert_one_byte(before, 18, 26 | 0x80)
+        self.assertEqual(maximum.native_value, 26)
+        self.assertIsNone(minimum.native_value)
+        before = self.prefix
+        await minimum.async_set_native_value(0)
+        self._assert_one_byte(before, 19, 0x80)
+        self.assertEqual(minimum.native_value, 0)
+        self.assertEqual(maximum.native_value, 26)
+        snapshot = coordinator.data
+        assert snapshot is not None
+        self.assertEqual(snapshot.sleep_cool_c, 32)
+        self.assertEqual(snapshot.sleep_heat_c, 16)
+        self.assertEqual(snapshot.away_minimum_c, 18)
+        self.assertEqual(snapshot.away_maximum_c, 28)
+        before = self.prefix
+        await coordinator.async_set(PreferenceField.ALERT_MAXIMUM, None)
+        self._assert_one_byte(before, 18, 0)
+        self.assertIsNone(maximum.native_value)
+        self.assertEqual(minimum.native_value, 0)
+        self.assertTrue(maximum.available)
+
+    async def test_existing_fields_reject_none_before_a_write(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        before = self.connections
+        for field in (
+            PreferenceField.SLEEP_COOL,
+            PreferenceField.SLEEP_HEAT,
+            PreferenceField.AWAY_MINIMUM,
+            PreferenceField.AWAY_MAXIMUM,
+        ):
+            with self.subTest(field=field), self.assertRaises(PreferenceRejectedError):
+                await coordinator.async_set(field, None)
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+
+    async def test_alert_bounds_use_the_fresh_partner_and_ignore_disabled(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        numbers = self._numbers(coordinator)
+        minimum = numbers[PreferenceField.ALERT_MINIMUM]
+        enabled = bytearray(self.prefix)
+        enabled[18] = 20 | 0x80
+        self.prefix = bytes(enabled)
+        before = self.connections
+        with self.assertRaises(HomeAssistantError):
+            await minimum.async_set_native_value(21)
+        self.assertEqual(self.connections, before + 1)
+        self.assertEqual(self.writes, [])
+        self.assertIsNone(minimum.native_value)
+        await minimum.async_set_native_value(20)
+        self._assert_one_byte(bytes(enabled), 19, 20 | 0x80)
+        disabled = bytearray(_console_prefix())
+        disabled[18] = 0x11
+        disabled[19] = 0x22
+        self.prefix = bytes(disabled)
+        await coordinator.async_refresh()
+        await minimum.async_set_native_value(50)
+        self._assert_one_byte(bytes(disabled), 19, 50 | 0x80)
+        self.assertEqual(minimum.native_value, 50)
+        self.assertIsNone(numbers[PreferenceField.ALERT_MAXIMUM].native_value)
+
+    async def test_alert_rejections_and_readback_failures_do_not_write(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 21 | 0x80
+        prefix[19] = 10 | 0x80
+        self.prefix = bytes(prefix)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        number = self._numbers(coordinator)[PreferenceField.ALERT_MAXIMUM]
+        self.assertEqual(number.native_value, 21)
+        before = self.connections
+        for value in (51, -1, 10.5, True, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(HomeAssistantError):
+                await number.async_set_native_value(cast("float", value))
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+        self.mode = "error"
+        with self.assertRaises(HomeAssistantError):
+            await number.async_set_native_value(22)
+        self.assertEqual(number.native_value, 21)
+        self.assertEqual(self.prefix[18], 21 | 0x80)
+        self.mode = "mismatch"
+        with self.assertRaises(HomeAssistantError):
+            await number.async_set_native_value(23)
+        self.assertEqual(number.native_value, 21)
+        self.assertEqual(self.prefix, bytes(prefix))
+
+    async def test_alert_and_sleep_changes_keep_both_bytes(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        original = self.prefix
+        await asyncio.gather(
+            coordinator.async_set(PreferenceField.SLEEP_COOL, 24),
+            coordinator.async_set(PreferenceField.ALERT_MAXIMUM, 30),
+        )
+        self.assertEqual(self.max_active, 1)
+        self.assertEqual(len(self.writes), 2)
+        final = bytearray(original)
+        final[22] = 24
+        final[18] = 30 | 0x80
+        self.assertEqual(self.writes[-1], bytes(final))
+        changed = [
+            index
+            for index, byte in enumerate(self.writes[0])
+            if byte != original[index]
+        ]
+        self.assertEqual(len(changed), 1)
+        snapshot = coordinator.data
+        assert snapshot is not None
+        self.assertEqual(snapshot.sleep_cool_c, 24)
+        self.assertEqual(snapshot.alert_maximum_c, 30)
+        self.assertEqual(snapshot.away_minimum_c, 18)
+        self.assertEqual(snapshot.prefix[19], original[19])
+        self.assertEqual(snapshot.prefix[24:], original[24:])
+
+    async def test_alert_fahrenheit_service_uses_the_one_point_eight_step(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 21 | 0x80
+        prefix[19] = 21 | 0x80
+        self.prefix = bytes(prefix)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        self.hass.config.units = US_CUSTOMARY_SYSTEM
+        numbers = self._numbers(coordinator)
+        for field, offset in (
+            (PreferenceField.ALERT_MAXIMUM, 18),
+            (PreferenceField.ALERT_MINIMUM, 19),
+        ):
+            with self.subTest(field=field):
+                number = numbers[field]
+                self.assertEqual(number.step, 1.8)
+                self.assertEqual(number.value, 69.8)
+                assert number.value is not None
+                before = bytes(self.prefix)
+                await cast("_NumberServiceModule", number_component).async_set_value(
+                    number,
+                    ServiceCall(
+                        cast("HomeAssistant", self.hass),
+                        "number",
+                        "set_value",
+                        {"value": number.value + number.step},
+                    ),
+                )
+                self._assert_one_byte(before, offset, 22 | 0x80)
+                self.assertEqual(number.native_value, 22)
+                self.assertEqual(number.value, 71.6)
+
     async def test_server_error_and_readback_mismatch_keep_the_previous_value(
         self,
     ) -> None:
@@ -720,6 +1062,15 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             port=self.port,
         )
         self.assertIsNotNone(installed)
+        preference_owner = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", live),
+            port=self.port,
+        )
+        if preference_owner is None:
+            raise AssertionError("expected a preference owner")
+        self.coordinators.append(preference_owner)
         with patch(
             "custom_components.airtouch.number.devices.AirTouchDevice",
             return_value=_Device(),
@@ -727,11 +1078,13 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             await async_setup_entry(
                 cast("Any", self.hass), cast("Any", self.entry), add_entities
             )
-        self.assertEqual(len(added[1]), 4)
+        self.assertEqual(len(added[1]), 6)
         self.assertFalse(added[1][0].available)
         self.assertEqual(
             sorted(entity.unique_id for entity in added[1]),
             [
+                "hub_alert_maximum",
+                "hub_alert_minimum",
                 "hub_away_maximum",
                 "hub_away_minimum",
                 "hub_sleep_cool",
@@ -749,8 +1102,47 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         )
         number = added[1][0]
         assert isinstance(number, PreferenceNumber)
-        await number.coordinator.async_shutdown()
+        await async_release_preferences(cast("Any", self.hass), self.entry.entry_id)
         await async_release(cast("Any", self.hass), self.entry.entry_id)
+
+    async def test_shutdown_drains_admitted_work_and_rejects_late_writes(self) -> None:
+        coordinator = self._coordinator(deadline=2)
+        numbers = self._numbers(coordinator)
+        await coordinator.async_refresh()
+        self.hold_once = True
+        admitted = asyncio.create_task(
+            numbers[PreferenceField.AWAY_MINIMUM].async_set_native_value(12)
+        )
+        await asyncio.wait_for(self.started.wait(), 1)
+        queued = asyncio.create_task(
+            numbers[PreferenceField.AWAY_MAXIMUM].async_set_native_value(30)
+        )
+        poll = asyncio.create_task(coordinator.async_refresh())
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
+        self.assertFalse(poll.done())
+        self.assertEqual(self.writes, [])
+        closing = asyncio.create_task(coordinator.async_shutdown())
+        await asyncio.sleep(0.05)
+        self.assertFalse(admitted.done())
+        self.assertFalse(closing.done())
+        self.release.set()
+        await asyncio.wait_for(admitted, 2)
+        with self.assertRaises(HomeAssistantError):
+            await asyncio.wait_for(queued, 2)
+        await asyncio.wait_for(poll, 2)
+        await asyncio.wait_for(closing, 2)
+        snapshot = coordinator.data
+        assert snapshot is not None
+        self.assertEqual(snapshot.away_minimum_c, 12)
+        self.assertEqual(snapshot.away_maximum_c, 28)
+        self.assertFalse(coordinator.last_update_success)
+        self.assertFalse(numbers[PreferenceField.AWAY_MINIMUM].available)
+        seen = self.connections
+        with self.assertRaises(HomeAssistantError):
+            await numbers[PreferenceField.SLEEP_COOL].async_set_native_value(24)
+        await coordinator.async_refresh()
+        self.assertEqual(self.connections, seen)
 
     async def test_unload_stops_later_refreshes(self) -> None:
         coordinator = self._coordinator()
@@ -784,6 +1176,444 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             coordinator = self._coordinator()
         self.assertIs(coordinator.config_entry, self.entry)
         self.assertIn(coordinator.async_shutdown, self.entry.unloads)
+
+    def _bind_root(self, api: _Api) -> tuple[Any, Any, Any]:
+        def connect(*, model: object, host: str) -> _Api:
+            del model, host
+            return api
+
+        def preference_client(
+            host: str, port: int, *, deadline: float = DEFAULT_DEADLINE
+        ) -> ConsoleClient:
+            del port
+            return ConsoleClient(host, self.port, deadline=deadline)
+
+        def smart_client(
+            host: str, port: int, *, deadline: float = DEFAULT_DEADLINE
+        ) -> ConsoleClient:
+            del port
+            return ConsoleClient(host, self.port, deadline=deadline)
+
+        return (
+            patch("custom_components.airtouch.pyairtouch.connect", connect),
+            patch(
+                "custom_components.airtouch.preferences.ConsoleClient",
+                preference_client,
+            ),
+            patch(
+                "custom_components.airtouch.smart_settings.ConsoleClient",
+                smart_client,
+            ),
+        )
+
+    async def test_install_is_shared_and_excludes_airtouch_4(self) -> None:
+        before = self.connections
+        owner = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if owner is None:
+            raise AssertionError("expected an AirTouch 5 owner")
+        self.coordinators.append(owner)
+        self.assertEqual(self.connections, before)
+        self.assertIs(
+            get_preferences(cast("Any", self.hass), self.entry.entry_id), owner
+        )
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            async_install_preferences(
+                cast("Any", self.hass),
+                cast("Any", self.entry),
+                cast("Any", _AirTouch()),
+                port=self.port,
+            )
+        self.assertIsNone(
+            async_install_preferences(
+                cast("Any", self.hass),
+                cast("Any", _Entry()),
+                cast("Any", _AirTouch(AirTouchModel.AIRTOUCH_4)),
+                port=self.port,
+            )
+        )
+        empty = await async_collect_preference_numbers(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", _AirTouch(AirTouchModel.AIRTOUCH_4)),
+            unique_id="hub",
+            device_info=cast("Any", _DEVICE_INFO),
+        )
+        self.assertEqual(empty, [])
+        self.assertEqual(self.connections, before)
+        first = await async_collect_preference_numbers(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", _AirTouch()),
+            unique_id="hub",
+            device_info=cast("Any", _DEVICE_INFO),
+        )
+        second = await async_collect_preference_numbers(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", _AirTouch()),
+            unique_id="hub",
+            device_info=cast("Any", _DEVICE_INFO),
+        )
+        self.assertEqual(len(first), 6)
+        self.assertTrue(
+            all(
+                isinstance(number, PreferenceNumber) and number.coordinator is owner
+                for number in first
+            )
+        )
+        self.assertTrue(
+            all(
+                isinstance(number, PreferenceNumber) and number.coordinator is owner
+                for number in second
+            )
+        )
+        assert isinstance(first[0], PreferenceNumber)
+        assert isinstance(second[0], PreferenceNumber)
+        self.assertIs(first[0].coordinator.data, second[0].coordinator.data)
+        api_marker = object()
+        lock = object()
+        self.hass.data[DOMAIN] = {"lock": lock, self.entry.entry_id: api_marker}
+        self.assertIs(
+            get_preferences(cast("Any", self.hass), self.entry.entry_id), owner
+        )
+        self.assertIs(self.hass.data[DOMAIN][self.entry.entry_id], api_marker)
+        self.assertIs(self.hass.data[DOMAIN]["lock"], lock)
+
+    async def test_two_entries_release_reload_and_overlap(self) -> None:
+        left_entry = _Entry()
+        left_entry.entry_id = "left"
+        right_entry = _Entry()
+        right_entry.entry_id = "right"
+        left = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", left_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        right = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", right_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if left is None or right is None:
+            raise AssertionError("expected two owners")
+        self.coordinators.extend((left, right))
+        self.assertIsNot(left, right)
+        self.hass.data[DOMAIN] = {
+            "lock": object(),
+            left_entry.entry_id: object(),
+            right_entry.entry_id: object(),
+        }
+        domain_ids = set(self.hass.data[DOMAIN])
+        await async_release_preferences(cast("Any", self.hass), left_entry.entry_id)
+        await async_release_preferences(cast("Any", self.hass), left_entry.entry_id)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_preferences(cast("Any", self.hass), left_entry.entry_id)
+        self.assertIs(
+            get_preferences(cast("Any", self.hass), right_entry.entry_id), right
+        )
+        self.assertEqual(set(self.hass.data[DOMAIN]), domain_ids)
+        seen = self.connections
+        await left.async_refresh()
+        self.assertEqual(self.connections, seen)
+        await right.async_refresh()
+        self.assertGreater(self.connections, seen)
+        reloaded = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", left_entry),
+            cast("Any", _AirTouch()),
+            port=self.port,
+        )
+        if reloaded is None:
+            raise AssertionError("expected a reloaded owner")
+        self.coordinators.append(reloaded)
+        self.assertIsNot(reloaded, left)
+        self.assertIs(
+            get_preferences(cast("Any", self.hass), left_entry.entry_id), reloaded
+        )
+        self.hold_all = True
+        self.max_active = 0
+        self.release.clear()
+        both = asyncio.gather(reloaded.async_refresh(), right.async_refresh())
+        await self._wait_until_active(2)
+        self.assertEqual(self.max_active, 2)
+        self.release.set()
+        await asyncio.wait_for(both, 2)
+
+    async def test_root_setup_installs_before_forward_without_reading(self) -> None:
+        api = _Api()
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+        forwarded: list[str] = []
+
+        async def forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            forwarded.append("forward")
+            self.assertEqual(self.connections, 0)
+            owner = get_preferences(
+                cast("Any", self.hass), cast("Any", config_entry).entry_id
+            )
+            self.coordinators.append(owner)
+            self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+
+        self.hass.config_entries = _ConfigEntries(forward)
+        connect, preferences, smart = self._bind_root(api)
+        with connect, preferences, smart:
+            result = await async_setup_integration(
+                cast("Any", self.hass), cast("Any", entry)
+            )
+        self.assertTrue(result)
+        self.assertEqual(forwarded, ["forward"])
+        owner = get_preferences(cast("Any", self.hass), entry.entry_id)
+        self.assertIs(owner.data, None)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+
+    async def test_failed_initial_read_does_not_block_climate(self) -> None:
+        api = _Api()
+        api.air_conditioners = [_Ac(0, "East")]
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+        self.mode = "truncate"
+        added: list[Any] = []
+
+        async def forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            self.assertEqual(self.connections, 0)
+
+            added.extend(
+                await async_collect_preference_numbers(
+                    cast("Any", self.hass),
+                    cast("Any", config_entry),
+                    cast("Any", api),
+                    unique_id="hub",
+                    device_info=cast("Any", _DEVICE_INFO),
+                )
+            )
+
+            def add_climate(
+                new_entities: Iterable[Entity],
+                update_before_add: bool = False,  # noqa: FBT001, FBT002
+            ) -> None:
+                del update_before_add
+                added.extend(new_entities)
+
+            with (
+                patch(
+                    "custom_components.airtouch.climate.devices.AirTouchDevice",
+                    _Console,
+                ),
+                patch(
+                    "custom_components.airtouch.climate.entity_platform.async_get_current_platform",
+                    return_value=_Platform(),
+                ),
+            ):
+                await climate.async_setup_entry(
+                    cast("Any", self.hass), cast("Any", config_entry), add_climate
+                )
+
+        self.hass.config_entries = _ConfigEntries(forward)
+        connect, preferences, smart = self._bind_root(api)
+        with connect, preferences, smart:
+            result = await async_setup_integration(
+                cast("Any", self.hass), cast("Any", entry)
+            )
+        self.assertTrue(result)
+        preference_numbers = [
+            entity for entity in added if isinstance(entity, PreferenceNumber)
+        ]
+        self.assertEqual(len(preference_numbers), 6)
+        self.assertTrue(all(not entity.available for entity in preference_numbers))
+        self.assertIn("hub_ac0", [entity.unique_id for entity in added])
+        owner = get_preferences(cast("Any", self.hass), entry.entry_id)
+        self.coordinators.append(owner)
+        self.assertFalse(owner.last_update_success)
+        self.assertEqual(api.shutdown_calls, 0)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+
+    async def test_forward_failure_and_cancellation_release_the_owner(self) -> None:
+        api = _Api()
+        for error in (RuntimeError("forward failed"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                entry = _RootEntry(type(error).__name__, SelectedModel.AIRTOUCH_5.value)
+
+                async def forward(
+                    config_entry: object,
+                    platforms: object,
+                    *,
+                    failure: BaseException = error,
+                ) -> None:
+                    del platforms
+                    self.assertEqual(self.connections, 0)
+                    get_preferences(
+                        cast("Any", self.hass), cast("Any", config_entry).entry_id
+                    )
+                    raise failure
+
+                self.hass.config_entries = _ConfigEntries(forward)
+                connect, preferences, smart = self._bind_root(api)
+                with (
+                    connect,
+                    preferences,
+                    smart,
+                    self.assertRaises(type(error)),
+                ):
+                    await async_setup_integration(
+                        cast("Any", self.hass), cast("Any", entry)
+                    )
+                with self.assertRaisesRegex(RuntimeError, "not installed"):
+                    get_preferences(cast("Any", self.hass), entry.entry_id)
+                self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+                self.assertEqual(api.shutdown_calls, 0)
+                self.assertEqual(self.connections, 0)
+
+        started = asyncio.Event()
+        cancelled = _RootEntry("cancelled", SelectedModel.AIRTOUCH_5.value)
+
+        async def wait_forward(config_entry: object, platforms: object) -> None:
+            del config_entry, platforms
+            started.set()
+            await asyncio.Event().wait()
+
+        self.hass.config_entries = _ConfigEntries(wait_forward)
+        connect, preferences, smart = self._bind_root(api)
+        with connect, preferences, smart:
+            task = asyncio.create_task(
+                async_setup_integration(cast("Any", self.hass), cast("Any", cancelled))
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            self.assertEqual(self.connections, 0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_preferences(cast("Any", self.hass), cancelled.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][cancelled.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+
+    async def test_cleanup_errors_keep_the_setup_error(self) -> None:
+        api = _Api()
+        entry = _RootEntry("cleanup", SelectedModel.AIRTOUCH_5.value)
+
+        async def fail_forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            get_preferences(cast("Any", self.hass), cast("Any", config_entry).entry_id)
+            raise RuntimeError("forward failed")
+
+        async def bad_preferences(hass: object, entry_id: str) -> None:
+            del hass, entry_id
+            raise RuntimeError("preference release failed")
+
+        async def bad_ac(hass: object, entry_id: str) -> None:
+            del hass, entry_id
+            raise RuntimeError("ac release failed")
+
+        self.hass.config_entries = _ConfigEntries(fail_forward)
+        connect, preferences, smart = self._bind_root(api)
+        with (
+            connect,
+            preferences,
+            smart,
+            patch("custom_components.airtouch.async_release_ac_settings", bad_ac),
+            patch(
+                "custom_components.airtouch.async_release_preferences",
+                bad_preferences,
+            ),
+            self.assertLogs("custom_components.airtouch", level="ERROR") as logged,
+            self.assertRaisesRegex(RuntimeError, "forward failed"),
+        ):
+            await async_setup_integration(cast("Any", self.hass), cast("Any", entry))
+        output = "\n".join(logged.output)
+        self.assertIn("Error releasing AirTouch AC settings", output)
+        self.assertIn("Error releasing AirTouch preferences", output)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), entry.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][entry.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+        await async_release_preferences(cast("Any", self.hass), entry.entry_id)
+
+        created = _RootEntry("create", SelectedModel.AIRTOUCH_5.value)
+
+        def broken_client(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("preference create failed")
+
+        async def quiet_forward(config_entry: object, platforms: object) -> None:
+            del config_entry, platforms
+
+        self.hass.config_entries = _ConfigEntries(quiet_forward)
+        connect, preferences, smart = self._bind_root(api)
+        with (
+            connect,
+            preferences,
+            smart,
+            patch(
+                "custom_components.airtouch.preferences.ConsoleClient",
+                broken_client,
+            ),
+            self.assertRaisesRegex(RuntimeError, "preference create failed"),
+        ):
+            await async_setup_integration(cast("Any", self.hass), cast("Any", created))
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_preferences(cast("Any", self.hass), created.entry_id)
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_smart_settings(cast("Any", self.hass), created.entry_id)
+        self.assertIs(self.hass.data[DOMAIN][created.entry_id], api)
+        self.assertEqual(api.shutdown_calls, 0)
+
+    async def test_unload_false_retains_and_success_closes(self) -> None:
+        api = _Api()
+        entry = _RootEntry("root", SelectedModel.AIRTOUCH_5.value)
+
+        async def forward(config_entry: object, platforms: object) -> None:
+            del platforms
+            owner = get_preferences(
+                cast("Any", self.hass), cast("Any", config_entry).entry_id
+            )
+            self.coordinators.append(owner)
+
+        self.hass.config_entries = _ConfigEntries(forward, unload_ok=False)
+        connect, preferences, smart = self._bind_root(api)
+        with connect, preferences, smart:
+            self.assertTrue(
+                await async_setup_integration(
+                    cast("Any", self.hass), cast("Any", entry)
+                )
+            )
+        owner = get_preferences(cast("Any", self.hass), entry.entry_id)
+        self.assertFalse(
+            await async_unload_integration(cast("Any", self.hass), cast("Any", entry))
+        )
+        self.assertIs(get_preferences(cast("Any", self.hass), entry.entry_id), owner)
+        self.assertEqual(api.shutdown_calls, 0)
+        seen = self.connections
+        await owner.async_refresh()
+        self.assertGreater(self.connections, seen)
+        number = self._numbers(owner)[PreferenceField.AWAY_MINIMUM]
+        await number.async_set_native_value(19)
+        self.hass.config_entries.unload_ok = True
+        self.assertTrue(
+            await async_unload_integration(cast("Any", self.hass), cast("Any", entry))
+        )
+        self.assertEqual(api.shutdown_calls, 1)
+        self.assertNotIn(entry.entry_id, self.hass.data[DOMAIN])
+        with self.assertRaisesRegex(RuntimeError, "not installed"):
+            get_preferences(cast("Any", self.hass), entry.entry_id)
+        before = self.connections
+        with self.assertRaises(HomeAssistantError):
+            await number.async_set_native_value(20)
+        self.assertEqual(self.connections, before)
+
+    async def _wait_until_active(self, count: int) -> None:
+        for _ in range(50):
+            if self.active >= count:
+                return
+            await asyncio.sleep(0.02)
+        self.fail(f"timed out waiting for {count} active connections")
 
 
 def _preference_numbers(

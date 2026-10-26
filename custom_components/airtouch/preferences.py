@@ -1,6 +1,5 @@
-"""AirTouch 5 sleep and away temperature limits.
+"""The targets belong to the console, not to an individual air conditioner.
 
-The four targets belong to the console, not to an individual air conditioner.
 A write sends the first 32 preference bytes back with one temperature changed.
 """
 
@@ -13,10 +12,11 @@ import struct
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final, assert_never, cast
 
 from homeassistant.config_entries import current_entry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from pyairtouch import AirTouchModel
 from pyairtouch.at5.api import DEFAULT_PORT_NUMBER
 
 if TYPE_CHECKING:
@@ -37,6 +37,12 @@ _SLEEP_HIGH: Final = 32
 _SLEEP_HEAT_HIGH: Final = 31
 _AWAY_LOW: Final = 0
 _AWAY_HIGH: Final = 50
+_ALERT_LOW: Final = 0
+_ALERT_HIGH: Final = 50
+_ALERT_ENABLED: Final = 0x80
+_ALERT_VALUE_MASK: Final = 0x7F
+_ALERT_MAXIMUM_OFFSET: Final = 18
+_ALERT_MINIMUM_OFFSET: Final = 19
 _AWAY_MAXIMUM_OFFSET: Final = 20
 _AWAY_MINIMUM_OFFSET: Final = 21
 _SLEEP_COOL_OFFSET: Final = 22
@@ -48,6 +54,7 @@ _SET_ID: Final = 0x44
 _NO_REPEAT: Final = 0
 _UPDATE_INTERVAL: Final = 60
 _WHOLE_DEGREE_TOLERANCE: Final = 1e-6
+_OWNERS_KEY: Final = "airtouch_preferences"
 _SUBHEADER: Final = struct.Struct("!BxHHH")
 
 
@@ -58,6 +65,8 @@ class PreferenceField(Enum):
     SLEEP_HEAT = "sleep_heat"
     AWAY_MINIMUM = "away_minimum"
     AWAY_MAXIMUM = "away_maximum"
+    ALERT_MINIMUM = "alert_minimum"
+    ALERT_MAXIMUM = "alert_maximum"
 
 
 class PreferenceRejectedError(Exception):
@@ -81,9 +90,11 @@ class PreferenceSnapshot:
     away_maximum_c: int
     sleep_cool_c: int
     sleep_heat_c: int
+    alert_minimum_c: int | None
+    alert_maximum_c: int | None
 
-    def value(self, field: PreferenceField) -> int:
-        """Return one decoded temperature."""
+    def value(self, field: PreferenceField) -> int | None:
+        """Return one decoded temperature, or None when an alert is disabled."""
         match field:
             case PreferenceField.SLEEP_COOL:
                 return self.sleep_cool_c
@@ -93,6 +104,10 @@ class PreferenceSnapshot:
                 return self.away_minimum_c
             case PreferenceField.AWAY_MAXIMUM:
                 return self.away_maximum_c
+            case PreferenceField.ALERT_MINIMUM:
+                return self.alert_minimum_c
+            case PreferenceField.ALERT_MAXIMUM:
+                return self.alert_maximum_c
             case _ as unreachable:
                 assert_never(unreachable)
 
@@ -121,6 +136,8 @@ def parse_preference_report(payload: bytes) -> PreferenceSnapshot:
         sleep_heat_c=_sleep_temperature(
             prefix[_SLEEP_HEAT_OFFSET], zero_means=_SLEEP_HEAT_WHEN_ZERO
         ),
+        alert_maximum_c=_alert_temperature(prefix[_ALERT_MAXIMUM_OFFSET]),
+        alert_minimum_c=_alert_temperature(prefix[_ALERT_MINIMUM_OFFSET]),
     )
 
 
@@ -138,6 +155,7 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
     ) -> None:
         self._client = ConsoleClient(airtouch.host, port, deadline=deadline)
         self._preference_transaction_lock = asyncio.Lock()
+        self._closed = False
         token = current_entry.set(entry)
         try:
             super().__init__(
@@ -149,24 +167,34 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
         finally:
             current_entry.reset(token)
 
-    async def async_set(self, field: PreferenceField, value: float) -> None:
-        """Change one temperature after a fresh read and a matching readback."""
-        try:
-            whole = whole_degrees(value)
-        except (TypeError, ValueError) as err:
-            raise PreferenceRejectedError(str(err)) from err
-        _require_range(field, whole)
+    async def async_set(self, field: PreferenceField, value: float | None) -> None:
+        """Change one temperature after a fresh read and a matching readback.
+
+        None disables an alert threshold. Sleep and away temperatures reject it.
+        """
+        stored = _accepted_value(field, value)
         async with self._preference_transaction_lock:
+            if self._closed:
+                raise PreferenceExchangeError("preference owner is closed")
             fresh = await self._read_snapshot()
-            prefix = _patched_prefix(fresh, field, whole)
+            prefix = _patched_prefix(fresh, field, stored)
             await self._write_prefix(prefix)
             confirmed = await self._read_snapshot()
-            if confirmed.prefix != prefix or confirmed.value(field) != whole:
+            if confirmed.prefix != prefix or confirmed.value(field) != stored:
                 raise PreferenceExchangeError("preference readback differed")
             self.async_set_updated_data(confirmed)
 
+    async def async_shutdown(self) -> None:
+        """Refuse new work, stop scheduling, and wait for an admitted transaction."""
+        self._closed = True
+        await super().async_shutdown()
+        async with self._preference_transaction_lock:
+            pass
+
     async def _async_update_data(self) -> PreferenceSnapshot:
         async with self._preference_transaction_lock:
+            if self._closed:
+                raise UpdateFailed("preference owner is closed")
             try:
                 return await self._read_snapshot()
             except PreferenceExchangeError as err:
@@ -199,12 +227,91 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
             raise PreferenceExchangeError("preference write failed") from err
 
 
+def async_install_preferences(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    airtouch: AirTouch,
+    *,
+    port: int = DEFAULT_PORT_NUMBER,
+    deadline: float = DEFAULT_DEADLINE,
+) -> PreferenceCoordinator | None:
+    """Install one AirTouch 5 preference owner without reading the console.
+
+    A second install is rejected. Reload installs a new owner after release.
+    """
+    if airtouch.model != AirTouchModel.AIRTOUCH_5:
+        return None
+    owners = _owners(hass)
+    if entry.entry_id in owners:
+        raise RuntimeError("preference owner is already installed")
+    coordinator = PreferenceCoordinator(
+        hass, entry, airtouch, port=port, deadline=deadline
+    )
+    owners[entry.entry_id] = coordinator
+    return coordinator
+
+
+def get_preferences(hass: HomeAssistant, entry_id: str) -> PreferenceCoordinator:
+    """Return the preference owner installed for this config entry."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if isinstance(stored, dict):
+        coordinator = stored.get(entry_id)
+        if isinstance(coordinator, PreferenceCoordinator):
+            return coordinator
+    raise RuntimeError("preference owner is not installed")
+
+
+async def async_release_preferences(hass: HomeAssistant, entry_id: str) -> None:
+    """Stop and forget this entry's preference owner. Missing owners stay absent."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if not isinstance(stored, dict):
+        return
+    owners = cast("dict[str, PreferenceCoordinator]", stored)
+    coordinator = owners.pop(entry_id, None)
+    if not owners:
+        hass.data.pop(_OWNERS_KEY, None)
+    if isinstance(coordinator, PreferenceCoordinator):
+        await coordinator.async_shutdown()
+
+
+def _owners(hass: HomeAssistant) -> dict[str, PreferenceCoordinator]:
+    stored = hass.data.get(_OWNERS_KEY)
+    if stored is None:
+        created: dict[str, PreferenceCoordinator] = {}
+        hass.data[_OWNERS_KEY] = created
+        return created
+    if not isinstance(stored, dict):
+        raise TypeError("preference owner map is invalid")
+    return cast("dict[str, PreferenceCoordinator]", stored)
+
+
 def _query_payload() -> bytes:
     return _SUBHEADER.pack(_REPORT_ID, _NO_REPEAT, _NO_REPEAT, _NO_REPEAT)
 
 
 def _write_payload(prefix: bytes) -> bytes:
     return _SUBHEADER.pack(_SET_ID, _PREFIX_LENGTH, _NO_REPEAT, _NO_REPEAT) + prefix
+
+
+def _alert_temperature(raw: int) -> int | None:
+    if (raw & _ALERT_ENABLED) == 0:
+        return None
+    return raw & _ALERT_VALUE_MASK
+
+
+def _accepted_value(field: PreferenceField, value: float | None) -> int | None:
+    if value is None:
+        if field not in _NULLABLE_FIELDS:
+            raise PreferenceRejectedError(
+                "temperature must be a whole number of degrees"
+            )
+        return None
+    try:
+        whole = whole_degrees(value)
+    except (TypeError, ValueError) as err:
+        raise PreferenceRejectedError(str(err)) from err
+    _require_range(field, whole)
+    return whole
 
 
 def _sleep_temperature(raw: int, *, zero_means: int) -> int:
@@ -239,7 +346,7 @@ def _require_range(field: PreferenceField, value: int) -> None:
 
 
 def _patched_prefix(
-    snapshot: PreferenceSnapshot, field: PreferenceField, value: int
+    snapshot: PreferenceSnapshot, field: PreferenceField, value: int | None
 ) -> bytes:
     _require_order(snapshot, field, value)
     prefix = bytearray(snapshot.prefix)
@@ -248,17 +355,31 @@ def _patched_prefix(
 
 
 def _require_order(
-    snapshot: PreferenceSnapshot, field: PreferenceField, value: int
+    snapshot: PreferenceSnapshot, field: PreferenceField, value: int | None
 ) -> None:
+    if value is None:
+        return
     if field is PreferenceField.AWAY_MINIMUM and value > snapshot.away_maximum_c:
         raise PreferenceRejectedError("away minimum is above away maximum")
     if field is PreferenceField.AWAY_MAXIMUM and snapshot.away_minimum_c > value:
         raise PreferenceRejectedError("away minimum is above away maximum")
+    if field is PreferenceField.ALERT_MINIMUM:
+        partner = snapshot.alert_maximum_c
+        if partner is not None and value > partner:
+            raise PreferenceRejectedError("alert minimum is above alert maximum")
+    if field is PreferenceField.ALERT_MAXIMUM:
+        partner = snapshot.alert_minimum_c
+        if partner is not None and partner > value:
+            raise PreferenceRejectedError("alert minimum is above alert maximum")
 
 
-def _wire_byte(field: PreferenceField, value: int) -> int:
+def _wire_byte(field: PreferenceField, value: int | None) -> int:
+    if value is None:
+        return 0
     if field in {PreferenceField.SLEEP_COOL, PreferenceField.SLEEP_HEAT}:
         return value & _SLEEP_MASK
+    if field in _NULLABLE_FIELDS:
+        return value | _ALERT_ENABLED
     return value
 
 
@@ -267,10 +388,18 @@ PREFERENCE_LIMITS: Final = {
     PreferenceField.SLEEP_HEAT: (_SLEEP_LOW, _SLEEP_HEAT_HIGH),
     PreferenceField.AWAY_MINIMUM: (_AWAY_LOW, _AWAY_HIGH),
     PreferenceField.AWAY_MAXIMUM: (_AWAY_LOW, _AWAY_HIGH),
+    PreferenceField.ALERT_MINIMUM: (_ALERT_LOW, _ALERT_HIGH),
+    PreferenceField.ALERT_MAXIMUM: (_ALERT_LOW, _ALERT_HIGH),
+}
+_NULLABLE_FIELDS: Final = {
+    PreferenceField.ALERT_MINIMUM,
+    PreferenceField.ALERT_MAXIMUM,
 }
 _FIELD_OFFSET: Final = {
     PreferenceField.SLEEP_COOL: _SLEEP_COOL_OFFSET,
     PreferenceField.SLEEP_HEAT: _SLEEP_HEAT_OFFSET,
     PreferenceField.AWAY_MINIMUM: _AWAY_MINIMUM_OFFSET,
     PreferenceField.AWAY_MAXIMUM: _AWAY_MAXIMUM_OFFSET,
+    PreferenceField.ALERT_MINIMUM: _ALERT_MINIMUM_OFFSET,
+    PreferenceField.ALERT_MAXIMUM: _ALERT_MAXIMUM_OFFSET,
 }
