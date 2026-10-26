@@ -11,6 +11,7 @@
 - Added per-air-conditioner cool and heat limits and an auto-off duration for AirTouch 5.
 - Added AirTouch 5 console numbers for the home alert minimum and maximum.
 - Added AirTouch 5 relay output switches for Toggle outputs and buttons for Pulse outputs.
+- Added an AirTouch 5 Programs sensor that shows the weekly programs saved on the console and their settings. Programs still run on the console and cannot be changed from Home Assistant.
 
 ### Fixed
 

@@ -285,6 +285,57 @@ When a read fails, these sensors become unavailable until the next successful re
 
 </details>
 
+### Programs sensor (`sensor.<console_name>_programs`)
+An AirTouch 5 console gets one sensor for the weekly programs saved on it.
+The state is the number of saved programs, including disabled ones.
+The attributes show each program's saved times, days, and air conditioner, zone, and Beam settings.
+The console runs the programs itself.
+This sensor shows their saved configuration, not whether a program is running or when it runs next, and it cannot change programs.
+AirTouch 4 consoles do not get this sensor.
+
+The integration reads the programs about every 15 minutes on its own short connection.
+The `homeassistant.update_entity` action reads them again straight away.
+When a read fails, the sensor becomes unavailable until the next successful read rather than showing zero programs.
+Climate entities keep using the main console connection, and a failed program read does not stop them from loading.
+
+Where Home Assistant supports excluding attributes from history, only the count is recorded.
+Home Assistant 2023.8 lacks that support and may record the detailed attributes or drop them when they exceed Recorder's size limit.
+The attributes always describe the current configuration.
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `<count>` | The number of saved programs. `0` means the console reported none.
+ `unavailable` | The latest program read failed.
+
+#### Attributes
+ Attribute | Description
+-----------|-------------
+ `programs` | The saved programs in console order, as described below.
+ `reported_beam_ids` | The Beam IDs the console listed with the programs. The console builds this list from its first program, so another program can hold settings for a Beam that is not listed.
+
+Each program has these fields.
+
+ Field | Description
+-------|-------------
+ `id`, `name`, `enabled` | The console's program number, its name, and whether it is enabled. Disabled programs keep their saved settings.
+ `start`, `end` | Saved local times as `HH:MM`. `end` is null when the program has no end time.
+ `days` | Selected days, Monday first.
+ `exclude_holidays` | `true` when the program skips public holidays.
+ `affects_air_conditioners`, `affects_zones` | The saved flags for whether the program changes air conditioners and zones.
+ `air_conditioners` | Each air conditioner's `index` (counted from 0), `power`, `advanced`, `mode`, `fan`, and `setpoint` in °C. The console applies `advanced` only while `power` is on.
+ `zones` | Each zone's `index` (counted from 0), `power`, `turbo`, `advanced`, and either `setpoint` in °C or `open_percentage`. `separate_times`, `start`, and `end` are the zone's own saved window. The console uses that window for a zone that is on with separate times selected, and the program's times otherwise.
+ `beams` | Each Beam's `beam_id`, `power`, `advanced`, `mode`, `fan`, and `setpoint` in °C. `beams` is null when the console did not report Beams for the program. A Beam missing from the list was not reported, which does not mean it is off.
+
+`mode_code` and `fan_code` are the console's raw values.
+`mode` or `fan` is null when a code has no known meaning.
+Beam fans are labelled only for codes 0 to 6, because the console's Beam writer and reader disagree about the others.
+
+</details>
+
 ### :thermometer: Number: Sleep and away targets
 An AirTouch 5 console gets four [**number**][hass-number] entities for the temperatures Sleep and Away use.
 The values belong to the console, not to an individual air conditioner.

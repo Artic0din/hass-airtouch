@@ -22,6 +22,7 @@ from .const import (
 )
 from .io_outputs import async_install_io_outputs, async_release_io_outputs
 from .preferences import async_install_preferences, async_release_preferences
+from .programs import async_install_programs, async_release_programs
 from .smart_settings import async_install, async_release
 
 if TYPE_CHECKING:
@@ -102,6 +103,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         async_install_preferences(hass, entry, airtouch)
         io_outputs = async_install_io_outputs(hass, entry, airtouch)
+        async_install_programs(hass, entry, airtouch)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         if owner is not None:
             await owner.async_refresh()
@@ -119,6 +121,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_release_after_setup_failure(
     hass: HomeAssistant, entry_id: str, *, release_smart: bool
 ) -> None:
+    try:
+        await async_release_programs(hass, entry_id)
+    except Exception:
+        _LOGGER.exception("Error releasing AirTouch programs after setup failure")
     try:
         await async_release_io_outputs(hass, entry_id)
     except Exception:
@@ -143,6 +149,7 @@ async def _async_release_after_setup_failure(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await async_release_programs(hass, entry.entry_id)
         await async_release_io_outputs(hass, entry.entry_id)
         await async_release_ac_settings(hass, entry.entry_id)
         await async_release_preferences(hass, entry.entry_id)
