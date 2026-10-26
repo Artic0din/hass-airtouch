@@ -38,6 +38,8 @@ _INFO_OFFSET: Final = 3
 # is greater than 5.
 _ENERGY_INDEX: Final = 5
 _MINIMUM_INFO_LENGTH: Final = _ENERGY_INDEX + 1
+_DIFFERENTIAL_INDICES: Final = (1, 3)
+_DISABLED_DIFFERENTIAL: Final = 0xFF
 _DISABLED_BYTE: Final = 0
 _ENABLED_BYTE: Final = 1
 _WRITE_COUNT: Final = 0
@@ -159,6 +161,13 @@ class EnergyWastageCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
             raise SmartSettingsExchangeError("energy wastage read failed") from err
 
     async def _write_info(self, info: bytes) -> None:
+        # The console's write handler turns a disabled -1 differential into 255.
+        if any(
+            info[index] == _DISABLED_DIFFERENTIAL for index in _DIFFERENTIAL_INDICES
+        ):
+            raise SmartSettingsRejectedError(
+                "Cannot update smart settings with a disabled weather differential"
+            )
         try:
             body = await self._client.request(
                 _write_payload(info),

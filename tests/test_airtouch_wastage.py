@@ -400,6 +400,27 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.other.append(payload)
         return self.info
 
+    async def test_disabled_weather_differential_blocks_write(self) -> None:
+        for index in (1, 3):
+            with self.subTest(differential_index=index):
+                info = bytearray(_SAMPLE_INFO)
+                info[index] = 0xFF
+                self.info = bytes(info)
+                coordinator = self._coordinator()
+                await coordinator.async_refresh()
+                switch = self._switch(coordinator)
+                snapshot = coordinator.data
+                before = len(self.writes)
+                self.assertTrue(switch.available)
+                self.assertFalse(switch.is_on)
+                with self.assertRaisesRegex(
+                    HomeAssistantError, "disabled weather differential"
+                ):
+                    await switch.async_turn_on()
+                self.assertEqual(len(self.writes), before)
+                self.assertEqual(self.info, bytes(info))
+                self.assertIs(coordinator.data, snapshot)
+
     async def test_query_and_write_frames_keep_the_other_bytes(self) -> None:
         self.decoy = True
         coordinator = self._coordinator()

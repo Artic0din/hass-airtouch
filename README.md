@@ -330,6 +330,9 @@ The switch enables or disables that check.
 Each change reads fresh settings and preserves the other settings, including weather adaptation and auto-off.
 The switch shows a new state only after the console confirms it.
 A failed change leaves the switch at the last confirmed on or off state, and Home Assistant reports the error.
+Changes are blocked if the console reports a disabled weather-adaptation differential.
+The console's write handler cannot preserve that disabled value when settings are sent back.
+Set a numeric differential on the console before changing this switch.
 
 The integration reads this setting about once a minute on its own short connection.
 When that periodic read fails, the switch becomes unavailable until the next successful read.
