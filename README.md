@@ -285,6 +285,39 @@ When a read fails, these sensors become unavailable until the next successful re
 
 </details>
 
+### :thermometer: Number: Sleep and away targets
+An AirTouch 5 console gets four [**number**][hass-number] entities for the temperatures Sleep and Away use.
+The values belong to the console, not to an individual air conditioner.
+AirTouch 4 consoles do not get these entities.
+The climate Away and Sleep presets are unchanged and still switch an air conditioner into that mode.
+
+Sleep cool is 16–32°C and sleep heat is 16–31°C, in whole degrees.
+The console's five-bit sleep-heat decoder reads an encoded 32°C as 16°C, so this integration rejects that value.
+Away minimum and away maximum are whole degrees from 0 to 50.
+Away minimum has to stay at or below away maximum.
+The integration reads the console preference, changes only that temperature, and checks the console stored it.
+The other preference bytes stay as they were.
+A failed change leaves the previous number in place.
+The integration reads these temperatures about once a minute on its own short connection.
+When a read fails, these numbers become unavailable until the next successful read.
+Climate entities keep using the main console connection.
+
+`number.<console_name>_sleep_cool`
+`number.<console_name>_sleep_heat`
+`number.<console_name>_away_minimum`
+`number.<console_name>_away_maximum`
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `<value>` | The temperature in °C.
+ `unavailable` | The latest preference read failed.
+
+</details>
+
 ### :battery: Binary Sensor: Battery (`binary_sensor.<zone_name>_battery`)
 A [**binary sensor**][hass-binary] is created for each zone with a temperature sensor to represent the battery state.
 
@@ -445,6 +478,7 @@ If you would like to make a donation as appreciation of my work:
 [hass-climate]: https://www.home-assistant.io/integrations/climate/
 [hass-cover]: https://www.home-assistant.io/integrations/cover/
 [hass-customizing-entities]: https://www.home-assistant.io/docs/configuration/customizing-devices/
+[hass-number]: https://www.home-assistant.io/integrations/number/
 [hass-sensor]: https://www.home-assistant.io/integrations/sensor/
 [hass-time]: https://www.home-assistant.io/integrations/time/
 [hass-update]: https://www.home-assistant.io/integrations/update/

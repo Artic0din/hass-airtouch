@@ -61,6 +61,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"custom_components/airtouch/number.py" = ["D100", "D101", "D103"]
 "tests/**/*.py" = ["D100", "D101", "D104", "PLR2004", "PT009", "PT027", "S101"]
 
 [tool.ruff.lint.pydocstyle]

@@ -22,6 +22,20 @@
           }
         }
       }
+    },
+    "number": {
+      "sleep_cool": {
+        "default": "mdi:snowflake"
+      },
+      "sleep_heat": {
+        "default": "mdi:fire"
+      },
+      "away_minimum": {
+        "default": "mdi:thermometer-low"
+      },
+      "away_maximum": {
+        "default": "mdi:thermometer-high"
+      }
     }
   },
   "services": {

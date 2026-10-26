@@ -127,6 +127,20 @@
       "zone_run_time_today": {
         "name": "Run time today"
       }
+    },
+    "number": {
+      "sleep_cool": {
+        "name": "Sleep cool"
+      },
+      "sleep_heat": {
+        "name": "Sleep heat"
+      },
+      "away_minimum": {
+        "name": "Away minimum"
+      },
+      "away_maximum": {
+        "name": "Away maximum"
+      }
     }
   },
   "services": {
