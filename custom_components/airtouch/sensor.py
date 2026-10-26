@@ -1,20 +1,45 @@
 """Polyaire AirTouch sensor entities."""
 
+import enum
+import inspect
 import logging
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pyairtouch
+import voluptuous
 from homeassistant.components import sensor
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTemperature, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation, entity_platform, service
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterable
+
+    from homeassistant.helpers.entity import Entity
+
 from . import climate, devices, entities
 from .const import CONF_SPILL_BYPASS, CONF_SPILL_ZONES, DOMAIN, SpillBypass
+from .geofence import (
+    GeofenceCoordinator,
+    GeofenceEventError,
+    GeofenceSnapshot,
+    GeofenceUncertainError,
+    SafeText,
+    Transition,
+    get_geofence,
+    safe_text,
+)
 from .programs import ProgramCoordinator, get_programs
 from .usage import UsageCoordinator, UsageSnapshot, local_now
 
@@ -116,9 +141,88 @@ async def async_setup_entry(
             hass, config_entry, airtouch, airtouch_device
         )
     )
+    discovered_entities.extend(
+        await async_collect_geofence_entities(
+            hass, config_entry, airtouch, airtouch_device
+        )
+    )
 
     _LOGGER.debug("Found entities: %s", discovered_entities)
     async_add_devices(discovered_entities)
+
+    platform = entity_platform.async_get_current_platform()
+    _register_geofence_presence(platform)
+
+
+class _PlatformListServiceCall(Protocol):
+    def __call__(
+        self,
+        hass: HomeAssistant,
+        platforms: "Iterable[entity_platform.EntityPlatform]",
+        func: "Callable[[Entity, ServiceCall], Awaitable[ServiceResponse]]",
+        call: ServiceCall,
+        required_features: "Iterable[int]",
+    ) -> "Awaitable[ServiceResponse]": ...
+
+
+def _register_geofence_presence(platform: entity_platform.EntityPlatform) -> None:
+    hass = platform.hass
+    name = "post_geofence_presence"
+    if hass.services.has_service(DOMAIN, name):
+        return
+    schema: dict[str | voluptuous.Marker, object] = {
+        voluptuous.Required("transition"): voluptuous.In(("enter", "exit")),
+        voluptuous.Required("identity"): _safe_text,
+        voluptuous.Optional("email"): _safe_text,
+    }
+    features = [GeofenceFeature.POST_PRESENCE]
+    if (
+        "supports_response"
+        in inspect.signature(platform.async_register_entity_service).parameters
+    ):
+        platform.async_register_entity_service(
+            name=name,
+            schema=schema,
+            func="async_post_geofence_presence",
+            required_features=features,
+            supports_response=SupportsResponse.ONLY,
+        )
+        return
+    domain = platform.domain
+    dispatch = cast("_PlatformListServiceCall", service.entity_service_call)
+
+    async def handle(call: ServiceCall) -> ServiceResponse:
+        platforms = [
+            item
+            for item in hass.data[entity_platform.DATA_ENTITY_PLATFORM][DOMAIN]
+            if item.domain == domain
+        ]
+        return await dispatch(hass, platforms, _post_keyed_presence, call, features)
+
+    hass.services.async_register(
+        DOMAIN,
+        name,
+        handle,
+        voluptuous.Schema(config_validation.make_entity_service_schema(schema)),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+
+async def _post_keyed_presence(entity: "Entity", call: ServiceCall) -> ServiceResponse:
+    geofence_entity = cast("GeofenceEntity", entity)
+    response = await geofence_entity.async_post_geofence_presence(
+        call.data["transition"], call.data["identity"], call.data.get("email")
+    )
+    return {entity.entity_id: response}
+
+
+def _safe_text(value: object) -> SafeText:
+    if not isinstance(value, str):
+        raise voluptuous.Invalid("value must be text")
+    try:
+        return safe_text(value)
+    except ValueError as err:
+        raise voluptuous.Invalid(str(err)) from None
 
 
 async def async_collect_usage_entities(
@@ -179,6 +283,31 @@ async def async_collect_program_entities(
     await coordinator.async_refresh()
     return [
         ProgramsEntity(
+            coordinator=coordinator,
+            unique_id=airtouch_device.unique_id,
+            device_info=airtouch_device.device_info,
+        )
+    ]
+
+
+async def async_collect_geofence_entities(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    airtouch: pyairtouch.AirTouch,
+    airtouch_device: devices.AirTouchDevice,
+) -> list[sensor.SensorEntity]:
+    """Create the AirTouch 5 geofence sensor.
+
+    Other models have no geofence sensor. A failed read does not fail
+    platform setup.
+    """
+    if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
+        return []
+
+    coordinator = get_geofence(hass, config_entry.entry_id)
+    await coordinator.async_refresh()
+    return [
+        GeofenceEntity(
             coordinator=coordinator,
             unique_id=airtouch_device.unique_id,
             device_info=airtouch_device.device_info,
@@ -524,6 +653,61 @@ class ProgramsEntity(CoordinatorEntity[ProgramCoordinator], sensor.SensorEntity)
     def extra_state_attributes(self) -> dict[str, object] | None:
         data = self.coordinator.data
         return None if data is None else data.attributes()
+
+
+class GeofenceFeature(enum.IntFlag):  # noqa: D101
+    POST_PRESENCE = 1
+
+
+class GeofenceEntity(CoordinatorEntity[GeofenceCoordinator], sensor.SensorEntity):
+    """How many native geofence accounts are inside, with settings and accounts.
+
+    The sensor stays available while its owner is open. After a failed read it
+    shows unknown, and an action with an explicit email can still post.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "geofence"
+    _attr_supported_features = GeofenceFeature.POST_PRESENCE
+    _unrecorded_attributes = frozenset({"accounts"})
+
+    def __init__(
+        self,
+        coordinator: GeofenceCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{unique_id}_geofence"
+        self._attr_device_info = device_info
+
+    @property
+    def available(self) -> bool:
+        return not self.coordinator.closed
+
+    @property
+    def native_value(self) -> int | None:
+        data = self._snapshot()
+        return None if data is None else data.inside_count
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object] | None:
+        data = self._snapshot()
+        return None if data is None else data.attributes()
+
+    async def async_post_geofence_presence(
+        self, transition: str, identity: SafeText, email: SafeText | None = None
+    ) -> ServiceResponse:
+        try:
+            accepted = await self.coordinator.async_post_presence(
+                Transition[transition.upper()], identity, email
+            )
+        except (GeofenceEventError, GeofenceUncertainError) as err:
+            raise HomeAssistantError(str(err)) from err
+        return {"commands_queued": accepted.commands_queued}
+
+    def _snapshot(self) -> GeofenceSnapshot | None:
+        return self.coordinator.data if self.coordinator.last_update_success else None
 
 
 def _usage_now(hass: HomeAssistant | None) -> datetime | None:
