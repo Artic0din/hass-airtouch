@@ -20,6 +20,7 @@ from .const import (
     DOMAIN,
     AirTouchModel,
 )
+from .io_outputs import async_install_io_outputs, async_release_io_outputs
 from .preferences import async_install_preferences, async_release_preferences
 from .smart_settings import async_install, async_release
 
@@ -34,6 +35,7 @@ _LOCK_KEY = "lock"
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.CLIMATE,
     Platform.COVER,
     Platform.NUMBER,
@@ -99,9 +101,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     owner = async_install(hass, entry, airtouch)
     try:
         async_install_preferences(hass, entry, airtouch)
+        io_outputs = async_install_io_outputs(hass, entry, airtouch)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         if owner is not None:
             await owner.async_refresh()
+        if io_outputs is not None:
+            await io_outputs.async_refresh()
     except BaseException:
         await _async_release_after_setup_failure(
             hass, entry.entry_id, release_smart=owner is not None
@@ -114,6 +119,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_release_after_setup_failure(
     hass: HomeAssistant, entry_id: str, *, release_smart: bool
 ) -> None:
+    try:
+        await async_release_io_outputs(hass, entry_id)
+    except Exception:
+        _LOGGER.exception("Error releasing AirTouch relay outputs after setup failure")
     try:
         await async_release_ac_settings(hass, entry_id)
     except Exception:
@@ -134,6 +143,7 @@ async def _async_release_after_setup_failure(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await async_release_io_outputs(hass, entry.entry_id)
         await async_release_ac_settings(hass, entry.entry_id)
         await async_release_preferences(hass, entry.entry_id)
         await async_release(hass, entry.entry_id)

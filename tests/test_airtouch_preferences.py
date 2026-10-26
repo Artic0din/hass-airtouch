@@ -446,6 +446,11 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         self.hass = _Hass()
         self.entry = _Entry()
         self.coordinators: list[PreferenceCoordinator] = []
+        io_client = patch(
+            "custom_components.airtouch.io_outputs.ConsoleClient", self._io_client
+        )
+        io_client.start()
+        self.addCleanup(io_client.stop)
 
     async def asyncTearDown(self) -> None:
         self.release.set()
@@ -453,6 +458,12 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             await coordinator.async_shutdown()
         self.server.close()
         await self.server.wait_closed()
+
+    def _io_client(
+        self, host: str, port: int, *, deadline: float = DEFAULT_DEADLINE
+    ) -> ConsoleClient:
+        del port
+        return ConsoleClient(host, self.port, deadline=deadline)
 
     def _coordinator(self, *, deadline: float = 1.0) -> PreferenceCoordinator:
         coordinator = PreferenceCoordinator(

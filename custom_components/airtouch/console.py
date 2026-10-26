@@ -9,7 +9,8 @@ settings use the same framing with control message 0xC0.
 
 While answering a status query, the console can also push an extended
 message to every client. That push carries the console's own packet id, so it
-is collected beside the reply rather than matched to the request.
+is collected beside the reply rather than matched to the request. Relay
+outputs read their 0x5D report and FF 04 names this way.
 """
 
 from __future__ import annotations
