@@ -3,7 +3,8 @@
 The console inserts a zero after every three 0x55 bytes that follow the inner
 header prefix, including the checksum. pyairtouch encodes the logical header
 and checksum. This module adds that escape and reads one matching frame before
-the deadline.
+the deadline. Extended history uses message 0x1F. Preference settings use the
+same framing with control message 0xC0.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import struct
 from typing import Final
 
 from pyairtouch.at5.comms.hdr import (
+    ADDRESS_AIRTOUCH,
     ADDRESS_AIRTOUCH_EXTENDED,
     ADDRESS_CLIENT,
     At5Header,
@@ -21,6 +23,7 @@ from pyairtouch.at5.comms.hdr import (
     HeaderEncoder,
 )
 from pyairtouch.at5.comms.x1F_ext import MESSAGE_ID as EXTENDED_MESSAGE_ID
+from pyairtouch.at5.comms.xC0_ctrl_status import MESSAGE_ID as CONTROL_MESSAGE_ID
 from pyairtouch.comms import DecodeError
 from pyairtouch.comms.crc16 import Crc16Modbus
 
@@ -89,16 +92,43 @@ class ConsoleClient:
         or checksum ends the exchange. The connection lock is released on
         cancellation.
         """
+        return await self._exchange(
+            to_address=ADDRESS_AIRTOUCH_EXTENDED,
+            message_id=EXTENDED_MESSAGE_ID,
+            payload=payload,
+            echo_prefix=payload,
+        )
+
+    async def exchange_control(self, payload: bytes) -> bytes:
+        """Send one 0xC0 message and return the matching reply payload.
+
+        History replies repeat the request. A control reply keeps the packet
+        id and swaps the console and client addresses, and its subheader
+        lengths replace the request, so the first matching frame is the reply.
+        """
+        return await self._exchange(
+            to_address=ADDRESS_AIRTOUCH,
+            message_id=CONTROL_MESSAGE_ID,
+            payload=payload,
+            echo_prefix=None,
+        )
+
+    async def _exchange(
+        self,
+        *,
+        to_address: int,
+        message_id: int,
+        payload: bytes,
+        echo_prefix: bytes | None,
+    ) -> bytes:
         async with self._lock:
             packet_id = self._packet_id
-            self._packet_id = (
-                1 if self._packet_id == _PACKET_ID_MAX else self._packet_id + 1
-            )
+            self._packet_id = 1 if packet_id == _PACKET_ID_MAX else packet_id + 1
             header = At5Header(
-                to_address=ADDRESS_AIRTOUCH_EXTENDED,
+                to_address=to_address,
                 from_address=ADDRESS_CLIENT,
                 packet_id=packet_id,
-                message_id=EXTENDED_MESSAGE_ID,
+                message_id=message_id,
                 message_length=len(payload),
             )
             frame = encode_frame(header, payload)
@@ -112,7 +142,11 @@ class ConsoleClient:
                     await writer.drain()
                     try:
                         return await _read_matching(
-                            reader, packet_id=packet_id, request=payload
+                            reader,
+                            packet_id=packet_id,
+                            message_id=message_id,
+                            from_address=to_address,
+                            echo_prefix=echo_prefix,
                         )
                     except (asyncio.IncompleteReadError, OSError) as err:
                         raise ConsoleProtocolError("connection closed") from err
@@ -196,18 +230,25 @@ async def _read_frame(reader: asyncio.StreamReader) -> tuple[At5Header, bytes]:
 
 
 async def _read_matching(
-    reader: asyncio.StreamReader, *, packet_id: int, request: bytes
+    reader: asyncio.StreamReader,
+    *,
+    packet_id: int,
+    message_id: int,
+    from_address: int,
+    echo_prefix: bytes | None,
 ) -> bytes:
     while True:
         header, payload = await _read_frame(reader)
         if (
             header.to_address == ADDRESS_CLIENT
-            and header.from_address == ADDRESS_AIRTOUCH_EXTENDED
+            and header.from_address == from_address
             and header.packet_id == packet_id
-            and header.message_id == EXTENDED_MESSAGE_ID
-            and payload.startswith(request)
+            and header.message_id == message_id
+            and (echo_prefix is None or payload.startswith(echo_prefix))
         ):
-            return payload[len(request) :]
+            if echo_prefix is None:
+                return payload
+            return payload[len(echo_prefix) :]
         _LOGGER.debug(
             "Skipping console frame id=%s packet=%s",
             header.message_id,
