@@ -24,6 +24,7 @@ from .preferences import (
     PreferenceExchangeError,
     PreferenceField,
     PreferenceRejectedError,
+    get_preferences,
 )
 from .smart_settings import (
     SMART_NUMBER_RANGES,
@@ -102,12 +103,12 @@ async def async_collect_preference_numbers(
 ) -> list[NumberEntity]:
     """Create the four console numbers for an AirTouch 5.
 
-    Other models get no numbers. A failed preference read does not fail
-    platform setup.
+    The numbers share the owner installed for this entry. Other models get no
+    numbers. A failed preference read does not fail platform setup.
     """
     if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
         return []
-    coordinator = PreferenceCoordinator(hass, config_entry, airtouch)
+    coordinator = get_preferences(hass, config_entry.entry_id)
     await coordinator.async_refresh()
     return [
         PreferenceNumber(coordinator, unique_id, device_info, field)

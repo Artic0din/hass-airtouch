@@ -13,10 +13,11 @@ import struct
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final, assert_never, cast
 
 from homeassistant.config_entries import current_entry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from pyairtouch import AirTouchModel
 from pyairtouch.at5.api import DEFAULT_PORT_NUMBER
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ _SET_ID: Final = 0x44
 _NO_REPEAT: Final = 0
 _UPDATE_INTERVAL: Final = 60
 _WHOLE_DEGREE_TOLERANCE: Final = 1e-6
+_OWNERS_KEY: Final = "airtouch_preferences"
 _SUBHEADER: Final = struct.Struct("!BxHHH")
 
 
@@ -138,6 +140,7 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
     ) -> None:
         self._client = ConsoleClient(airtouch.host, port, deadline=deadline)
         self._preference_transaction_lock = asyncio.Lock()
+        self._closed = False
         token = current_entry.set(entry)
         try:
             super().__init__(
@@ -157,6 +160,8 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
             raise PreferenceRejectedError(str(err)) from err
         _require_range(field, whole)
         async with self._preference_transaction_lock:
+            if self._closed:
+                raise PreferenceExchangeError("preference owner is closed")
             fresh = await self._read_snapshot()
             prefix = _patched_prefix(fresh, field, whole)
             await self._write_prefix(prefix)
@@ -165,8 +170,17 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
                 raise PreferenceExchangeError("preference readback differed")
             self.async_set_updated_data(confirmed)
 
+    async def async_shutdown(self) -> None:
+        """Refuse new work, stop scheduling, and wait for an admitted transaction."""
+        self._closed = True
+        await super().async_shutdown()
+        async with self._preference_transaction_lock:
+            pass
+
     async def _async_update_data(self) -> PreferenceSnapshot:
         async with self._preference_transaction_lock:
+            if self._closed:
+                raise UpdateFailed("preference owner is closed")
             try:
                 return await self._read_snapshot()
             except PreferenceExchangeError as err:
@@ -197,6 +211,64 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
             TimeoutError,
         ) as err:
             raise PreferenceExchangeError("preference write failed") from err
+
+
+def async_install_preferences(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    airtouch: AirTouch,
+    *,
+    port: int = DEFAULT_PORT_NUMBER,
+    deadline: float = DEFAULT_DEADLINE,
+) -> PreferenceCoordinator | None:
+    """Install one AirTouch 5 preference owner without reading the console.
+
+    A second install is rejected. Reload installs a new owner after release.
+    """
+    if airtouch.model != AirTouchModel.AIRTOUCH_5:
+        return None
+    owners = _owners(hass)
+    if entry.entry_id in owners:
+        raise RuntimeError("preference owner is already installed")
+    coordinator = PreferenceCoordinator(
+        hass, entry, airtouch, port=port, deadline=deadline
+    )
+    owners[entry.entry_id] = coordinator
+    return coordinator
+
+
+def get_preferences(hass: HomeAssistant, entry_id: str) -> PreferenceCoordinator:
+    """Return the preference owner installed for this config entry."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if isinstance(stored, dict):
+        coordinator = stored.get(entry_id)
+        if isinstance(coordinator, PreferenceCoordinator):
+            return coordinator
+    raise RuntimeError("preference owner is not installed")
+
+
+async def async_release_preferences(hass: HomeAssistant, entry_id: str) -> None:
+    """Stop and forget this entry's preference owner. Missing owners stay absent."""
+    stored = hass.data.get(_OWNERS_KEY)
+    if not isinstance(stored, dict):
+        return
+    owners = cast("dict[str, PreferenceCoordinator]", stored)
+    coordinator = owners.pop(entry_id, None)
+    if not owners:
+        hass.data.pop(_OWNERS_KEY, None)
+    if isinstance(coordinator, PreferenceCoordinator):
+        await coordinator.async_shutdown()
+
+
+def _owners(hass: HomeAssistant) -> dict[str, PreferenceCoordinator]:
+    stored = hass.data.get(_OWNERS_KEY)
+    if stored is None:
+        created: dict[str, PreferenceCoordinator] = {}
+        hass.data[_OWNERS_KEY] = created
+        return created
+    if not isinstance(stored, dict):
+        raise TypeError("preference owner map is invalid")
+    return cast("dict[str, PreferenceCoordinator]", stored)
 
 
 def _query_payload() -> bytes:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import socket
 import struct
 import unittest
 from datetime import timedelta
@@ -50,6 +51,10 @@ from custom_components.airtouch.ac_settings import (
 from custom_components.airtouch.const import DOMAIN
 from custom_components.airtouch.const import AirTouchModel as SelectedModel
 from custom_components.airtouch.number import PreferenceNumber, async_setup_entry
+from custom_components.airtouch.preferences import (
+    async_install_preferences,
+    async_release_preferences,
+)
 from custom_components.airtouch.smart_settings import async_install, async_release
 
 _OUTER = b"\x55\x55\x55\xab"
@@ -1008,6 +1013,18 @@ class AcSettingsServerTests(unittest.IsolatedAsyncioTestCase):
         )
         if installed is None:
             raise AssertionError("expected smart settings")
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            closed_port = closed.getsockname()[1]
+        preference_owner = async_install_preferences(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", stand_in),
+            port=closed_port,
+            deadline=0.2,
+        )
+        if preference_owner is None:
+            raise AssertionError("expected preferences")
         added: list[list[Entity]] = []
 
         def add_entities(
@@ -1028,7 +1045,7 @@ class AcSettingsServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.connections, before)
         preference = added[0][0]
         assert isinstance(preference, PreferenceNumber)
-        await preference.coordinator.async_shutdown()
+        await async_release_preferences(cast("Any", self.hass), self.entry.entry_id)
         await async_release(cast("Any", self.hass), self.entry.entry_id)
 
     async def test_fahrenheit_service_conversion_leaves_duration_step(self) -> None:
