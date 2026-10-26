@@ -6,17 +6,21 @@ Sensors are used to represent:
 """
 
 import logging
+from datetime import datetime
 from typing import Any
 
 import pyairtouch
 from homeassistant.components import sensor
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTemperature
+from homeassistant.const import PERCENTAGE, UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import climate, devices, entities
 from .const import CONF_SPILL_BYPASS, CONF_SPILL_ZONES, DOMAIN, SpillBypass
+from .usage import UsageCoordinator, UsageSnapshot, local_now
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,8 +110,54 @@ async def async_setup_entry(
             )
             discovered_entities.append(ac_spill_bypass_percentage_entity)
 
+    discovered_entities.extend(
+        await async_collect_usage_entities(
+            hass, config_entry, airtouch, airtouch_device
+        )
+    )
+
     _LOGGER.debug("Found entities: %s", discovered_entities)
     async_add_devices(discovered_entities)
+
+
+async def async_collect_usage_entities(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    airtouch: pyairtouch.AirTouch,
+    airtouch_device: devices.AirTouchDevice,
+) -> list[sensor.SensorEntity]:
+    """Create AirTouch 5 run-time sensors.
+
+    Other models keep the existing sensor set. A failed history read does not
+    fail platform setup.
+    """
+    if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
+        return []
+
+    coordinator = UsageCoordinator(hass, config_entry, airtouch)
+    await coordinator.async_refresh()
+    discovered: list[sensor.SensorEntity] = []
+    for airtouch_ac in airtouch.air_conditioners:
+        ac_device = airtouch_device.ac_device(airtouch_ac)
+        discovered.append(
+            AcRunTimeEntity(
+                coordinator=coordinator,
+                unique_id=ac_device.unique_id,
+                device_info=ac_device.device_info,
+                ac_id=airtouch_ac.ac_id,
+            )
+        )
+        for airtouch_zone in airtouch_ac.zones:
+            zone_device = ac_device.zone_device(airtouch_zone)
+            discovered.append(
+                ZoneRunTimeEntity(
+                    coordinator=coordinator,
+                    unique_id=zone_device.unique_id,
+                    device_info=zone_device.device_info,
+                    zone_id=airtouch_zone.zone_id,
+                )
+            )
+    return discovered
 
 
 class AcTemperatureEntity(entities.AirTouchAcEntity, sensor.SensorEntity):  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -319,3 +369,112 @@ class SpillBypassPercentageEntity(entities.AirTouchAcEntity, sensor.SensorEntity
         )
         # The spill percentage can never be less than zero
         return max(0, self._spill_percentage_limit - zone_percentage_sum)
+
+
+class _UsageEntity(CoordinatorEntity[UsageCoordinator], sensor.SensorEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Run time today"
+    _attr_device_class = sensor.SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = sensor.SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        coordinator: UsageCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{unique_id}_run_time_today"
+        self._attr_device_info = device_info
+
+    @property
+    def available(self) -> bool:
+        if not super().available:
+            return False
+        now = _usage_now(self.hass)
+        data = self.coordinator.data
+        return now is not None and data is not None and data.local_date == now.date()
+
+    def _snapshot_now(self) -> tuple[UsageSnapshot, datetime] | None:
+        if not self.available:
+            return None
+        now = _usage_now(self.hass)
+        data = self.coordinator.data
+        if now is None or data is None:
+            return None
+        return data, now
+
+
+class AcRunTimeEntity(_UsageEntity):
+    """Today's air-conditioner run time, with mode and history attributes."""
+
+    _attr_translation_key = "ac_run_time_today"
+
+    def __init__(
+        self,
+        coordinator: UsageCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+        ac_id: int,
+    ) -> None:
+        super().__init__(coordinator, unique_id, device_info)
+        self._ac_id = ac_id
+
+    @property
+    def native_value(self) -> int | None:
+        current = self._snapshot_now()
+        if current is None:
+            return None
+        data, now = current
+        return data.ac_today_minutes(self._ac_id, now=now)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        current = self._snapshot_now()
+        if current is None:
+            return None
+        data, now = current
+        return data.ac_attributes(self._ac_id, now=now)
+
+
+class ZoneRunTimeEntity(_UsageEntity):
+    """Today's zone run time, with daily and hourly history attributes."""
+
+    _attr_translation_key = "zone_run_time_today"
+
+    def __init__(
+        self,
+        coordinator: UsageCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+        zone_id: int,
+    ) -> None:
+        super().__init__(coordinator, unique_id, device_info)
+        self._zone_id = zone_id
+
+    @property
+    def native_value(self) -> int | None:
+        current = self._snapshot_now()
+        if current is None:
+            return None
+        data, now = current
+        return data.zone_today_minutes(self._zone_id, now=now)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        current = self._snapshot_now()
+        if current is None:
+            return None
+        data, now = current
+        return data.zone_attributes(self._zone_id, now=now)
+
+
+def _usage_now(hass: HomeAssistant | None) -> datetime | None:
+    if hass is None:
+        return None
+    try:
+        return local_now(hass)
+    except (KeyError, ValueError):
+        return None
