@@ -1,9 +1,4 @@
-"""Polyaire AirTouch sensor entities.
-
-Sensors are used to represent:
-- the current temperature for the AC and any zones with sensors; and
-- the current damper open percentage for each zone.
-"""
+"""Polyaire AirTouch sensor entities."""
 
 import logging
 from datetime import datetime
@@ -20,6 +15,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import climate, devices, entities
 from .const import CONF_SPILL_BYPASS, CONF_SPILL_ZONES, DOMAIN, SpillBypass
+from .programs import ProgramCoordinator, get_programs
 from .usage import UsageCoordinator, UsageSnapshot, local_now
 
 _LOGGER = logging.getLogger(__name__)
@@ -115,6 +111,11 @@ async def async_setup_entry(
             hass, config_entry, airtouch, airtouch_device
         )
     )
+    discovered_entities.extend(
+        await async_collect_program_entities(
+            hass, config_entry, airtouch, airtouch_device
+        )
+    )
 
     _LOGGER.debug("Found entities: %s", discovered_entities)
     async_add_devices(discovered_entities)
@@ -158,6 +159,31 @@ async def async_collect_usage_entities(
                 )
             )
     return discovered
+
+
+async def async_collect_program_entities(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    airtouch: pyairtouch.AirTouch,
+    airtouch_device: devices.AirTouchDevice,
+) -> list[sensor.SensorEntity]:
+    """Create the AirTouch 5 programs sensor.
+
+    Other models have no programs sensor. A failed read does not fail
+    platform setup, and the sensor is created unavailable.
+    """
+    if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
+        return []
+
+    coordinator = get_programs(hass, config_entry.entry_id)
+    await coordinator.async_refresh()
+    return [
+        ProgramsEntity(
+            coordinator=coordinator,
+            unique_id=airtouch_device.unique_id,
+            device_info=airtouch_device.device_info,
+        )
+    ]
 
 
 class AcTemperatureEntity(entities.AirTouchAcEntity, sensor.SensorEntity):  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -469,6 +495,35 @@ class ZoneRunTimeEntity(_UsageEntity):
             return None
         data, now = current
         return data.zone_attributes(self._zone_id, now=now)
+
+
+class ProgramsEntity(CoordinatorEntity[ProgramCoordinator], sensor.SensorEntity):
+    """The number of saved programs, with their configuration as attributes."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "programs"
+    # Every program, zone and Beam setting can exceed the recorder's size limit.
+    _unrecorded_attributes = frozenset({"programs", "reported_beam_ids"})
+
+    def __init__(
+        self,
+        coordinator: ProgramCoordinator,
+        unique_id: str,
+        device_info: DeviceInfo,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{unique_id}_programs"
+        self._attr_device_info = device_info
+
+    @property
+    def native_value(self) -> int | None:
+        data = self.coordinator.data
+        return None if data is None else len(data.programs)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object] | None:
+        data = self.coordinator.data
+        return None if data is None else data.attributes()
 
 
 def _usage_now(hass: HomeAssistant | None) -> datetime | None:

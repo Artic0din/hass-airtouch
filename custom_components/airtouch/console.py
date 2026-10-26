@@ -11,6 +11,9 @@ While answering a status query, the console can also push an extended
 message to every client. That push carries the console's own packet id, so it
 is collected beside the reply rather than matched to the request. Relay
 outputs read their 0x5D report and FF 04 names this way.
+
+A program query is answered by two correlated replies, a base report and an
+extension, so that exchange reads both before it closes.
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from typing import Final
+from functools import partial
+from typing import TYPE_CHECKING, Final, TypeVar
 
 from pyairtouch.at5.comms.hdr import (
     ADDRESS_AIRTOUCH,
@@ -32,6 +36,9 @@ from pyairtouch.at5.comms.x1F_ext import MESSAGE_ID as EXTENDED_MESSAGE_ID
 from pyairtouch.at5.comms.xC0_ctrl_status import MESSAGE_ID as CONTROL_MESSAGE_ID
 from pyairtouch.comms import DecodeError
 from pyairtouch.comms.crc16 import Crc16Modbus
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +59,8 @@ _ADDRESS_ALL_CLIENTS: Final = 0xFF
 _ENCODER: Final = HeaderEncoder()
 _DECODER: Final = HeaderDecoder()
 _CRC: Final = Crc16Modbus()
+
+_T = TypeVar("_T")
 
 
 class ConsoleProtocolError(Exception):
@@ -115,10 +124,30 @@ class ConsoleClient:
             to_address=ADDRESS_AIRTOUCH_EXTENDED,
             message_id=EXTENDED_MESSAGE_ID,
             payload=payload,
-            reply_prefix=prefix,
-            broadcast_prefix=None,
+            read=partial(_read_matching, reply_prefix=prefix, broadcast_prefix=None),
         )
         return reply[len(prefix) :]
+
+    async def request_with_extension(
+        self, payload: bytes, *, extension_prefix: bytes
+    ) -> tuple[bytes, bytes]:
+        """Send one extended request and return the bodies of its two replies.
+
+        The base reply repeats the payload and the extension reply starts with
+        extension_prefix. Both keep the packet id and swap the console and
+        client addresses, and either can arrive first. Each body is returned
+        without its prefix. Unrelated valid frames are ignored. A second reply
+        with the same prefix, a bad header or checksum, or a closed connection
+        ends the exchange, and both replies must arrive before the deadline.
+        """
+        return await self._exchange(
+            to_address=ADDRESS_AIRTOUCH_EXTENDED,
+            message_id=EXTENDED_MESSAGE_ID,
+            payload=payload,
+            read=partial(
+                _read_pair, base_prefix=payload, extension_prefix=extension_prefix
+            ),
+        )
 
     async def exchange_control(self, payload: bytes) -> bytes:
         """Send one 0xC0 message and return the matching reply payload.
@@ -132,8 +161,7 @@ class ConsoleClient:
             to_address=ADDRESS_AIRTOUCH,
             message_id=CONTROL_MESSAGE_ID,
             payload=payload,
-            reply_prefix=b"",
-            broadcast_prefix=None,
+            read=partial(_read_matching, reply_prefix=b"", broadcast_prefix=None),
         )
         return reply
 
@@ -153,8 +181,11 @@ class ConsoleClient:
             to_address=ADDRESS_AIRTOUCH,
             message_id=CONTROL_MESSAGE_ID,
             payload=payload,
-            reply_prefix=payload[:1],
-            broadcast_prefix=broadcast_prefix,
+            read=partial(
+                _read_matching,
+                reply_prefix=payload[:1],
+                broadcast_prefix=broadcast_prefix,
+            ),
         )
 
     async def send_control(self, payload: bytes) -> None:
@@ -201,9 +232,8 @@ class ConsoleClient:
         to_address: int,
         message_id: int,
         payload: bytes,
-        reply_prefix: bytes,
-        broadcast_prefix: bytes | None,
-    ) -> tuple[bytes, bytes | None]:
+        read: Callable[[asyncio.StreamReader, At5Header], Awaitable[_T]],
+    ) -> _T:
         async with self._lock:
             request, frame = self._next_frame(to_address, message_id, payload)
             writer: asyncio.StreamWriter | None = None
@@ -215,12 +245,7 @@ class ConsoleClient:
                     writer.write(frame)
                     await writer.drain()
                     try:
-                        return await _read_matching(
-                            reader,
-                            request=request,
-                            reply_prefix=reply_prefix,
-                            broadcast_prefix=broadcast_prefix,
-                        )
+                        return await read(reader, request)
                     except (asyncio.IncompleteReadError, OSError) as err:
                         raise ConsoleProtocolError("connection closed") from err
             finally:
@@ -302,23 +327,26 @@ async def _read_frame(reader: asyncio.StreamReader) -> tuple[At5Header, bytes]:
     return _decode_inner(escaped)
 
 
+def _answers(header: At5Header, request: At5Header) -> bool:
+    return (
+        header.to_address == request.from_address
+        and header.from_address == request.to_address
+        and header.packet_id == request.packet_id
+        and header.message_id == request.message_id
+    )
+
+
 async def _read_matching(
     reader: asyncio.StreamReader,
-    *,
     request: At5Header,
+    *,
     reply_prefix: bytes,
     broadcast_prefix: bytes | None,
 ) -> tuple[bytes, bytes | None]:
     broadcast: bytes | None = None
     while True:
         header, payload = await _read_frame(reader)
-        if (
-            header.to_address == request.from_address
-            and header.from_address == request.to_address
-            and header.packet_id == request.packet_id
-            and header.message_id == request.message_id
-            and payload.startswith(reply_prefix)
-        ):
+        if _answers(header, request) and payload.startswith(reply_prefix):
             return payload, broadcast
         if (
             broadcast_prefix is not None
@@ -334,6 +362,33 @@ async def _read_matching(
             header.message_id,
             header.packet_id,
         )
+
+
+async def _read_pair(
+    reader: asyncio.StreamReader,
+    request: At5Header,
+    *,
+    base_prefix: bytes,
+    extension_prefix: bytes,
+) -> tuple[bytes, bytes]:
+    bodies: dict[bytes, bytes] = {}
+    while base_prefix not in bodies or extension_prefix not in bodies:
+        header, payload = await _read_frame(reader)
+        prefix = next(
+            (p for p in (base_prefix, extension_prefix) if payload.startswith(p)),
+            None,
+        )
+        if prefix is None or not _answers(header, request):
+            _LOGGER.debug(
+                "Skipping console frame id=%s packet=%s",
+                header.message_id,
+                header.packet_id,
+            )
+            continue
+        if prefix in bodies:
+            raise ConsoleProtocolError("duplicate reply")
+        bodies[prefix] = payload[len(prefix) :]
+    return bodies[base_prefix], bodies[extension_prefix]
 
 
 async def _close_writer_preserving_cancellation(writer: asyncio.StreamWriter) -> None:

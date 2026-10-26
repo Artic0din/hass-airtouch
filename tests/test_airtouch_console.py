@@ -30,6 +30,10 @@ _STATUS_REPORT = bytes.fromhex("5d000002000300010400020002")
 _OTHER_REPORT = bytes.fromhex("45000002000000000102")
 _NAMES = bytes.fromhex("ff04")
 _TRIGGER = bytes.fromhex("5c000008000000000000000100000000")
+_PROGRAMS = bytes.fromhex("ff41")
+_PROGRAMS_EXTENSION = bytes.fromhex("ff45")
+_BASE_BODY = bytes.fromhex("0000000000000102005555555510")
+_EXTENSION_BODY = bytes.fromhex("55555555555555")
 
 
 def _oracle_escape(inner: bytes) -> bytes:
@@ -143,6 +147,32 @@ def _broadcast(
     )
 
 
+def _extended_reply(
+    packet_id: int,
+    payload: bytes,
+    *,
+    to_address: int = _CLIENT,
+    from_address: int = _EXTENDED,
+    message_id: int = _EXTENDED_MESSAGE,
+) -> bytes:
+    return _frame(
+        to_address=to_address,
+        from_address=from_address,
+        packet_id=packet_id,
+        message_id=message_id,
+        payload=payload,
+    )
+
+
+def _program_pair(header: At5Header, payload: bytes) -> list[bytes]:
+    if payload != _PROGRAMS:
+        return _status_only(header, payload)
+    return [
+        _extended_reply(header.packet_id, _PROGRAMS + _BASE_BODY),
+        _extended_reply(header.packet_id, _PROGRAMS_EXTENSION + _EXTENSION_BODY),
+    ]
+
+
 async def _read_raw(reader: asyncio.StreamReader) -> bytes:
     outer = await reader.readexactly(10)
     length = struct.unpack_from("!H", outer, 6)[0]
@@ -165,7 +195,7 @@ async def _reset_drain(writer: asyncio.StreamWriter) -> None:
     raise ConnectionResetError("reset while draining")
 
 
-class ConsoleStatusAndSendTests(unittest.IsolatedAsyncioTestCase):
+class _ConsoleServerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.raw: list[bytes] = []
         self.received: list[tuple[At5Header, bytes]] = []
@@ -173,6 +203,7 @@ class ConsoleStatusAndSendTests(unittest.IsolatedAsyncioTestCase):
         self.replies: Callable[[At5Header, bytes], list[bytes]] = _status_only
         self.bytewise = False
         self.close_after_reply = False
+        self.reply_gap = 0.0
         self.handled = asyncio.Event()
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         sockets = self.server.sockets
@@ -203,10 +234,16 @@ class ConsoleStatusAndSendTests(unittest.IsolatedAsyncioTestCase):
             header, payload = _oracle_decode(raw)
             self.received.append((header, payload))
             self.handled.set()
-            data = b"".join(self.replies(header, payload))
+            frames = self.replies(header, payload)
+            data = b"".join(frames)
             if data and self.bytewise:
                 for index in range(len(data)):
                     writer.write(data[index : index + 1])
+                    await writer.drain()
+            elif self.reply_gap:
+                for frame in frames:
+                    await asyncio.sleep(self.reply_gap)
+                    writer.write(frame)
                     await writer.drain()
             elif data:
                 writer.write(data)
@@ -220,6 +257,8 @@ class ConsoleStatusAndSendTests(unittest.IsolatedAsyncioTestCase):
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+
+class ConsoleStatusAndSendTests(_ConsoleServerTestCase):
     async def test_status_query_frame_is_exact(self) -> None:
         report, names = await self._client().query_status(
             _STATUS_QUERY, broadcast_prefix=_NAMES
@@ -425,6 +464,152 @@ class ConsoleStatusAndSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(outcome, {"submitted", "uncertain"})
         await asyncio.wait_for(self.handled.wait(), 1)
         self.assertEqual([payload for _, payload in self.received], [_TRIGGER])
+
+
+class ConsolePairedReportTests(_ConsoleServerTestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.replies = _program_pair
+
+    async def _pair(self, client: console.ConsoleClient) -> tuple[bytes, bytes]:
+        return await client.request_with_extension(
+            _PROGRAMS, extension_prefix=_PROGRAMS_EXTENSION
+        )
+
+    async def test_one_query_frame_returns_both_bodies(self) -> None:
+        client = self._client()
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+        self.assertEqual(
+            self.raw,
+            [
+                _frame(
+                    to_address=_EXTENDED,
+                    from_address=_CLIENT,
+                    packet_id=1,
+                    message_id=_EXTENDED_MESSAGE,
+                    payload=bytes.fromhex("ff41"),
+                )
+            ],
+        )
+        await client.query_status(_STATUS_QUERY, broadcast_prefix=_NAMES)
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+        self.assertEqual([header.packet_id for header, _ in self.received], [1, 2, 3])
+        self.assertEqual(
+            [payload for _, payload in self.received],
+            [_PROGRAMS, _STATUS_QUERY, _PROGRAMS],
+        )
+        self.assertEqual(await self._client_closes(3), [b"", b"", b""])
+
+    async def test_either_order_fragmented_coalesced_and_escaped(self) -> None:
+        def reversed_pair(header: At5Header, payload: bytes) -> list[bytes]:
+            return list(reversed(_program_pair(header, payload)))
+
+        client = self._client()
+        for replies in (_program_pair, reversed_pair):
+            for bytewise in (False, True):
+                with self.subTest(order=replies.__name__, bytewise=bytewise):
+                    self.replies = replies
+                    self.bytewise = bytewise
+                    self.assertEqual(
+                        await self._pair(client), (_BASE_BODY, _EXTENSION_BODY)
+                    )
+        self.assertIn(
+            b"\x55\x55\x55\x00", _program_pair(self.received[0][0], _PROGRAMS)[1]
+        )
+
+    async def test_uncorrelated_frames_are_skipped(self) -> None:
+        decoy = b"\x00" * 8
+
+        def replies(header: At5Header, payload: bytes) -> list[bytes]:
+            del payload
+            packet = header.packet_id
+            return [
+                _extended_reply(packet, _PROGRAMS + decoy, to_address=_ALL_CLIENTS),
+                _extended_reply(
+                    packet, _PROGRAMS_EXTENSION + decoy, to_address=_ALL_CLIENTS
+                ),
+                _extended_reply(packet, _PROGRAMS + decoy, to_address=0xB1),
+                _extended_reply(packet + 1, _PROGRAMS + decoy),
+                _extended_reply(
+                    packet, _PROGRAMS_EXTENSION + decoy, from_address=_CONSOLE
+                ),
+                _extended_reply(packet, _PROGRAMS + decoy, message_id=_CONTROL),
+                _extended_reply(packet, bytes.fromhex("ff18") + decoy),
+                _extended_reply(packet, _PROGRAMS_EXTENSION + _EXTENSION_BODY),
+                _extended_reply(packet - 1, _PROGRAMS_EXTENSION + decoy),
+                _extended_reply(packet, _PROGRAMS + _BASE_BODY),
+                _extended_reply(packet, _PROGRAMS + decoy),
+            ]
+
+        self.replies = replies
+        self.assertEqual(
+            await self._pair(self._client()), (_BASE_BODY, _EXTENSION_BODY)
+        )
+
+    async def test_duplicate_reply_fails_even_when_identical(self) -> None:
+        client = self._client()
+        for first in (_PROGRAMS + _BASE_BODY, _PROGRAMS_EXTENSION + _EXTENSION_BODY):
+            with self.subTest(prefix=first[:2].hex()):
+
+                def replies(
+                    header: At5Header, payload: bytes, repeated: bytes = first
+                ) -> list[bytes]:
+                    return [
+                        _extended_reply(header.packet_id, repeated),
+                        _extended_reply(header.packet_id, repeated),
+                        *_program_pair(header, payload),
+                    ]
+
+                self.replies = replies
+                with self.assertRaisesRegex(console.ConsoleProtocolError, "duplicate"):
+                    await self._pair(client)
+        self.replies = _program_pair
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+
+    async def test_missing_partner_eof_and_corrupt_frames_fail(self) -> None:
+        client = self._client(deadline=0.3)
+        self.replies = lambda header, payload: _program_pair(header, payload)[:1]
+        with self.assertRaises(TimeoutError):
+            await self._pair(client)
+        self.close_after_reply = True
+        with self.assertRaisesRegex(console.ConsoleProtocolError, "closed"):
+            await self._pair(client)
+        self.close_after_reply = False
+
+        def bad_crc(header: At5Header, payload: bytes) -> list[bytes]:
+            base, extension = _program_pair(header, payload)
+            corrupt = bytearray(extension)
+            corrupt[-1] ^= 0xFF
+            return [base, bytes(corrupt)]
+
+        self.replies = bad_crc
+        with self.assertRaises(console.ConsoleChecksumError):
+            await self._pair(client)
+        self.replies = _program_pair
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+
+    async def test_one_deadline_covers_both_replies(self) -> None:
+        client = self._client(deadline=0.5)
+        self.reply_gap = 0.1
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+        self.reply_gap = 0.3
+        with self.assertRaises(TimeoutError):
+            await self._pair(client)
+
+    async def test_timeout_and_cancellation_close_and_release(self) -> None:
+        self.replies = lambda _header, _payload: []
+        client = self._client(deadline=0.3)
+        with self.assertRaises(TimeoutError):
+            await self._pair(client)
+        self.handled.clear()
+        task = asyncio.create_task(self._pair(client))
+        await asyncio.wait_for(self.handled.wait(), 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.replies = _program_pair
+        self.assertEqual(await self._pair(client), (_BASE_BODY, _EXTENSION_BODY))
+        self.assertEqual(await self._client_closes(3), [b"", b"", b""])
 
 
 if __name__ == "__main__":

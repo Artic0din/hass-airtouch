@@ -126,6 +126,9 @@
       },
       "zone_run_time_today": {
         "name": "Run time today"
+      },
+      "programs": {
+        "name": "Programs"
       }
     },
     "number": {
