@@ -47,6 +47,21 @@
       },
       "weather_adaptation_heat_target": {
         "default": "mdi:sun-thermometer"
+      },
+      "cool_minimum": {
+        "default": "mdi:thermometer-chevron-down"
+      },
+      "cool_maximum": {
+        "default": "mdi:thermometer-chevron-up"
+      },
+      "heat_minimum": {
+        "default": "mdi:thermometer-lines"
+      },
+      "heat_maximum": {
+        "default": "mdi:radiator"
+      },
+      "auto_off_duration": {
+        "default": "mdi:timer-sand"
       }
     },
     "switch": {

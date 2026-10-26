@@ -11,6 +11,7 @@ import pyairtouch
 from homeassistant.const import CONF_HOST, Platform
 from homeassistant.exceptions import ConfigEntryNotReady
 
+from .ac_settings import async_release_ac_settings
 from .const import (
     AIRTOUCH_MODEL_TO_API,
     CONF_AIRTOUCH_MODEL,
@@ -100,6 +101,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if owner is not None:
             await owner.async_refresh()
     except BaseException:
+        try:
+            await async_release_ac_settings(hass, entry.entry_id)
+        except Exception:
+            _LOGGER.exception(
+                "Error releasing AirTouch AC settings after setup failure"
+            )
         if owner is not None:
             try:
                 await async_release(hass, entry.entry_id)
@@ -115,6 +122,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await async_release_ac_settings(hass, entry.entry_id)
         await async_release(hass, entry.entry_id)
         airtouch: pyairtouch.AirTouch = hass.data[DOMAIN].pop(entry.entry_id)
         if airtouch:

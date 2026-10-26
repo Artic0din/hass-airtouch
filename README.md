@@ -378,6 +378,48 @@ A failed read while Home Assistant is setting up these entities does not stop th
 
 </details>
 
+### :thermometer: Numbers: Air conditioner limits
+Each AirTouch 5 air conditioner gets five [**number**][hass-number] entities for its cool and heat limits and its auto-off duration.
+AirTouch 4 air conditioners do not get these numbers.
+The numbers belong to that air conditioner.
+
+Cool and heat limits are whole degrees inside the brand range reported for that air conditioner.
+There is no fixed fallback range.
+The minimum has to stay at or below its maximum.
+Home Assistant displays those temperatures in your selected temperature unit, with steps of 1°C or 1.8°F.
+Auto-off duration is a whole number from 0 to 8 hours.
+Zero is the console's dash, meaning no duration.
+Changing the duration leaves the auto-off and auto-on flags as they were.
+
+Each change reads the current settings, changes one value, and sends that air conditioner's record back.
+The other air conditioners and the remaining bytes stay as they were read.
+The number shows a new state only after the console confirms it.
+A failed change leaves the previous value in place.
+
+The integration reads these settings about once a minute on its own short connection.
+When a read fails, this air conditioner is missing, or the brand range cannot be used, the affected numbers become unavailable until the next usable read.
+A value outside the accepted range shows as unknown.
+Climate entities keep using the main console connection.
+A failed read while Home Assistant is setting up these numbers does not stop the climate entities from loading.
+
+`number.<ac_name>_cool_minimum`
+`number.<ac_name>_cool_maximum`
+`number.<ac_name>_heat_minimum`
+`number.<ac_name>_heat_maximum`
+`number.<ac_name>_auto_off_duration`
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `<value>` | The console confirmed this limit or duration.
+ `unknown` | The reported value is outside the accepted range.
+ `unavailable` | The read failed, this air conditioner is missing, or the brand range cannot be used.
+
+</details>
+
 ### :battery: Binary Sensor: Battery (`binary_sensor.<zone_name>_battery`)
 A [**binary sensor**][hass-binary] is created for each zone with a temperature sensor to represent the battery state.
 

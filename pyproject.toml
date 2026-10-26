@@ -61,6 +61,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"custom_components/airtouch/ac_settings.py" = ["D100"]
 "custom_components/airtouch/number.py" = ["D100", "D101", "D103"]
 "custom_components/airtouch/switch.py" = ["D100", "D101", "D103"]
 "custom_components/airtouch/smart_settings.py" = ["D105"]
