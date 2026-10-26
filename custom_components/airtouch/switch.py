@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pyairtouch
 from homeassistant.components.switch import SwitchEntity
@@ -16,11 +16,20 @@ if TYPE_CHECKING:
 from . import devices
 from .const import DOMAIN
 from .smart_settings import (
-    EnergyWastageCoordinator,
+    SmartFlag,
+    SmartSettingsCoordinator,
     SmartSettingsExchangeError,
     SmartSettingsRejectedError,
     SmartSettingsSnapshot,
+    get_smart_settings,
 )
+
+_FLAG_NAMES: Final[dict[SmartFlag, str]] = {
+    SmartFlag.ADVANCED: "Advanced weather adaptation",
+    SmartFlag.ENERGY_WASTAGE: "Energy wastage detection",
+    SmartFlag.BASIC: "Weather adaptation",
+    SmartFlag.AUTO_OFF: "Weather adaptation auto off",
+}
 
 
 async def async_setup_entry(
@@ -34,7 +43,7 @@ async def async_setup_entry(
         return
     device = devices.AirTouchDevice(hass, config_entry.entry_id, airtouch)
     async_add_entities(
-        await async_collect_energy_wastage_switches(
+        await async_collect_smart_setting_switches(
             hass,
             config_entry,
             airtouch,
@@ -44,51 +53,60 @@ async def async_setup_entry(
     )
 
 
-async def async_collect_energy_wastage_switches(
+async def async_collect_smart_setting_switches(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     airtouch: pyairtouch.AirTouch,
     *,
     unique_id: str,
     device_info: DeviceInfo,
-) -> list[EnergyWastageSwitch]:
-    """Create the console switch for an AirTouch 5.
+) -> list[SmartSettingSwitch]:
+    """Create the console switches for an AirTouch 5.
 
-    Other models get no switch. A failed settings read does not fail platform
-    setup.
+    Other models get no switches. A failed settings read does not fail
+    platform setup.
     """
     if airtouch.model != pyairtouch.AirTouchModel.AIRTOUCH_5:
         return []
-    coordinator = EnergyWastageCoordinator(hass, config_entry, airtouch)
-    await coordinator.async_refresh()
-    return [EnergyWastageSwitch(coordinator, unique_id, device_info)]
+    coordinator = get_smart_settings(hass, config_entry.entry_id)
+    return [
+        SmartSettingSwitch(coordinator, unique_id, device_info, field)
+        for field in SmartFlag
+    ]
 
 
-class EnergyWastageSwitch(CoordinatorEntity[EnergyWastageCoordinator], SwitchEntity):
+class SmartSettingSwitch(CoordinatorEntity[SmartSettingsCoordinator], SwitchEntity):
     _attr_has_entity_name = True
-    _attr_translation_key = "energy_wastage_detection"
-    _attr_name = "Energy wastage detection"
 
     def __init__(
         self,
-        coordinator: EnergyWastageCoordinator,
+        coordinator: SmartSettingsCoordinator,
         unique_id: str,
         device_info: DeviceInfo,
+        field: SmartFlag,
     ) -> None:
         super().__init__(coordinator)
-        self._attr_unique_id = f"{unique_id}_energy_wastage_detection"
+        self._field = field
+        self._attr_translation_key = field.value
+        self._attr_name = _FLAG_NAMES[field]
+        self._attr_unique_id = f"{unique_id}_{field.value}"
         self._attr_device_info = device_info
 
     @property
     def available(self) -> bool:
-        return super().available and self.coordinator.data is not None
+        data = self.coordinator.data
+        return (
+            super().available
+            and data is not None
+            and data.flag(self._field) is not None
+        )
 
     @property
     def is_on(self) -> bool | None:
         data: SmartSettingsSnapshot | None = self.coordinator.data
         if not self.available or data is None:
             return None
-        return data.energy_wastage
+        return data.flag(self._field)
 
     async def async_turn_on(
         self,
@@ -106,6 +124,6 @@ class EnergyWastageSwitch(CoordinatorEntity[EnergyWastageCoordinator], SwitchEnt
 
     async def _apply(self, *, enabled: bool) -> None:
         try:
-            await self.coordinator.async_set(enabled=enabled)
+            await self.coordinator.async_set_flag(self._field, enabled=enabled)
         except (SmartSettingsRejectedError, SmartSettingsExchangeError) as err:
             raise HomeAssistantError(str(err)) from err

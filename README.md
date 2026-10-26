@@ -319,28 +319,51 @@ Climate entities keep using the main console connection.
 
 </details>
 
-### :window: Switch: Energy wastage detection
-An AirTouch 5 console gets one [**switch**][hass-switch] for energy wastage detection.
-The switch belongs to the console, not to an individual air conditioner.
-AirTouch 4 consoles do not get this switch.
+### :window: Switches: Weather adaptation and energy wastage
+An AirTouch 5 console gets four [**switches**][hass-switch] for weather adaptation and energy wastage detection.
+They belong to the console, not to an individual air conditioner.
+AirTouch 4 consoles do not get these switches.
 
-The console watches running temperature-controlled zones for warming during cooling or cooling during heating.
+Energy wastage detection watches running temperature-controlled zones for warming during cooling or cooling during heating.
 It can warn after a change of at least 2°C within 10 minutes, indicating a possible open door, open window, or airflow problem.
-The switch enables or disables that check.
 
-Each change reads fresh settings and preserves the other settings, including weather adaptation and auto-off.
-The switch shows a new state only after the console confirms it.
-A failed change leaves the switch at the last confirmed on or off state, and Home Assistant reports the error.
-Changes are blocked if the console reports a disabled weather-adaptation differential.
-The console's write handler cannot preserve that disabled value when settings are sent back.
-Set a numeric differential on the console before changing this switch.
+Weather adaptation is the basic mode.
+Auto off can turn the system off from that mode.
+Advanced weather adaptation uses the stored cool and heat differentials and comfort targets.
+Turning basic off also turns auto off off.
+Turning auto off on also turns basic on.
+Advanced and energy wastage change on their own.
+A read shows the pair the console reported, even when basic and auto off disagree.
 
-The integration reads this setting about once a minute on its own short connection.
-When that periodic read fails, the switch becomes unavailable until the next successful read.
+Comfort targets are stored from 16°C to 32°C.
+Home Assistant displays comfort targets in your selected temperature unit, with steps of 1°C or 1.8°F.
+Differentials are stored from 0°C to 15°C and stay in °C, because they are intervals rather than absolute temperatures.
+A number can be stored while advanced mode is off.
+That stored value does not turn advanced mode on.
+The console uses it when advanced mode is enabled.
+
+Each change reads fresh settings and writes the whole information block back.
+The entities show a new state only after the console confirms it.
+A failed change leaves the last confirmed state in place, and Home Assistant reports the error.
+A write is blocked while either differential is disabled.
+The console's write handler turns a disabled local value of -1 into 255, and no wire value is known that keeps the local -1.
+Replacing that disabled differential with a number from 0 to 15 is allowed when the other differential is already numeric.
+
+The integration reads these settings about once a minute on its own short connection.
+When that periodic read fails, these switches and numbers become unavailable until the next successful read.
+A report that is too short leaves only basic and auto off unavailable.
+An unsupported or disabled numeric value shows as unknown, and the number remains editable to accept a valid replacement.
 Climate entities keep using the main console connection.
-A failed read while Home Assistant is setting up this switch does not stop the climate entities from loading.
+A failed read while Home Assistant is setting up these entities does not stop the climate entities from loading.
 
+`switch.<console_name>_weather_adaptation_advanced`
 `switch.<console_name>_energy_wastage_detection`
+`switch.<console_name>_weather_adaptation_basic`
+`switch.<console_name>_weather_adaptation_auto_off`
+`number.<console_name>_weather_adaptation_cool_differential`
+`number.<console_name>_weather_adaptation_cool_target`
+`number.<console_name>_weather_adaptation_heat_differential`
+`number.<console_name>_weather_adaptation_heat_target`
 
 <details>
 <summary>States and Attributes</summary>
@@ -348,9 +371,10 @@ A failed read while Home Assistant is setting up this switch does not stop the c
 #### States
  State | Description
 -------|-------------
- `on` | Energy wastage detection is enabled.
- `off` | Energy wastage detection is disabled.
- `unavailable` | The latest periodic settings read failed. A failed change stays on the last confirmed state.
+ `on` / `<value>` | The console confirmed this switch or number.
+ `off` | The switch is disabled.
+ `unknown` | The console reported an unsupported or disabled numeric value. A valid replacement can be set.
+ `unavailable` | The console omitted a switch field, or the latest periodic settings read failed. A failed change stays on the last confirmed state.
 
 </details>
 

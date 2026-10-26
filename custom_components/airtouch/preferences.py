@@ -151,7 +151,10 @@ class PreferenceCoordinator(DataUpdateCoordinator[PreferenceSnapshot]):
 
     async def async_set(self, field: PreferenceField, value: float) -> None:
         """Change one temperature after a fresh read and a matching readback."""
-        whole = _whole_degrees(value)
+        try:
+            whole = whole_degrees(value)
+        except (TypeError, ValueError) as err:
+            raise PreferenceRejectedError(str(err)) from err
         _require_range(field, whole)
         async with self._preference_transaction_lock:
             fresh = await self._read_snapshot()
@@ -211,17 +214,20 @@ def _sleep_temperature(raw: int, *, zero_means: int) -> int:
     return masked
 
 
-def _whole_degrees(value: object) -> int:
+def whole_degrees(value: object) -> int:
+    """Return a whole number of degrees.
+
+    Floats within 1e-6 of an integer are accepted. Booleans and non-numeric
+    types raise TypeError; non-finite values and other fractions raise ValueError.
+    """
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise PreferenceRejectedError("temperature must be a whole number of degrees")
+        raise TypeError("temperature must be a whole number of degrees")
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise PreferenceRejectedError("temperature must be finite")
+            raise ValueError("temperature must be finite")
         whole = round(value)
         if not math.isclose(value, whole, rel_tol=0.0, abs_tol=_WHOLE_DEGREE_TOLERANCE):
-            raise PreferenceRejectedError(
-                "temperature must be a whole number of degrees"
-            )
+            raise ValueError("temperature must be a whole number of degrees")
         return whole
     return value
 

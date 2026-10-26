@@ -35,11 +35,32 @@
       },
       "away_maximum": {
         "default": "mdi:thermometer-high"
+      },
+      "weather_adaptation_cool_differential": {
+        "default": "mdi:thermometer-minus"
+      },
+      "weather_adaptation_heat_differential": {
+        "default": "mdi:thermometer-plus"
+      },
+      "weather_adaptation_cool_target": {
+        "default": "mdi:snowflake-thermometer"
+      },
+      "weather_adaptation_heat_target": {
+        "default": "mdi:sun-thermometer"
       }
     },
     "switch": {
       "energy_wastage_detection": {
         "default": "mdi:window-open"
+      },
+      "weather_adaptation_advanced": {
+        "default": "mdi:weather-partly-cloudy"
+      },
+      "weather_adaptation_basic": {
+        "default": "mdi:weather-sunny"
+      },
+      "weather_adaptation_auto_off": {
+        "default": "mdi:power-plug-off"
       }
     }
   },
