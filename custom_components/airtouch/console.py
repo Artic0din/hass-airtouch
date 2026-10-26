@@ -6,6 +6,10 @@ and checksum. This module adds that escape and reads one matching frame before
 the deadline. Extended history uses message 0x1F and repeats the request.
 Smart settings use that message with an FF 18 reply prefix. Preference
 settings use the same framing with control message 0xC0.
+
+While answering a status query, the console can also push an extended
+message to every client. That push carries the console's own packet id, so it
+is collected beside the reply rather than matched to the request.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ _STUFF_BYTE: Final = 0x00
 DEFAULT_DEADLINE: Final = 5.0
 _CLOSE_TIMEOUT: Final = 1.0
 _PACKET_ID_MAX: Final = 255
+_ADDRESS_ALL_CLIENTS: Final = 0xFF
 
 _ENCODER: Final = HeaderEncoder()
 _DECODER: Final = HeaderDecoder()
@@ -54,6 +59,10 @@ class ConsoleProtocolError(Exception):
 
 class ConsoleChecksumError(ConsoleProtocolError):
     """A framed message failed the logical CRC."""
+
+
+class ConsoleSendUncertainError(Exception):
+    """The connection failed after the frame was written, so it may have arrived."""
 
 
 def encode_frame(header: At5Header, payload: bytes) -> bytes:
@@ -101,12 +110,14 @@ class ConsoleClient:
         connection lock is released on cancellation.
         """
         prefix = payload if response_prefix is None else response_prefix
-        return await self._exchange(
+        reply, _ = await self._exchange(
             to_address=ADDRESS_AIRTOUCH_EXTENDED,
             message_id=EXTENDED_MESSAGE_ID,
             payload=payload,
-            echo_prefix=prefix,
+            reply_prefix=prefix,
+            broadcast_prefix=None,
         )
+        return reply[len(prefix) :]
 
     async def exchange_control(self, payload: bytes) -> bytes:
         """Send one 0xC0 message and return the matching reply payload.
@@ -114,13 +125,74 @@ class ConsoleClient:
         History replies repeat the request. A control reply keeps the packet
         id and swaps the console and client addresses, and its subheader
         lengths replace the request, so the first matching frame is the reply.
+        A setter can be answered by a report with another subcommand.
+        """
+        reply, _ = await self._exchange(
+            to_address=ADDRESS_AIRTOUCH,
+            message_id=CONTROL_MESSAGE_ID,
+            payload=payload,
+            reply_prefix=b"",
+            broadcast_prefix=None,
+        )
+        return reply
+
+    async def query_status(
+        self, payload: bytes, *, broadcast_prefix: bytes
+    ) -> tuple[bytes, bytes | None]:
+        """Send one 0xC0 status query and return its report and a broadcast body.
+
+        The report also has to repeat the requested subcommand, so a
+        correlated report about something else does not answer the query.
+        The broadcast body is what follows broadcast_prefix in the last
+        extended message to every client that arrived before the report, or
+        None. The exchange does not wait for a broadcast. Any frame with a bad
+        header or checksum still ends the exchange.
         """
         return await self._exchange(
             to_address=ADDRESS_AIRTOUCH,
             message_id=CONTROL_MESSAGE_ID,
             payload=payload,
-            echo_prefix=None,
+            reply_prefix=payload[:1],
+            broadcast_prefix=broadcast_prefix,
         )
+
+    async def send_control(self, payload: bytes) -> None:
+        """Write one 0xC0 message and close without waiting for any reply.
+
+        Returning means the frame was handed to the connection, not that the
+        console accepted or acted on it. OSError or TimeoutError means nothing
+        was written. ConsoleSendUncertainError means the connection failed
+        after writing began. Nothing is retried.
+        """
+        async with self._lock:
+            _, frame = self._next_frame(ADDRESS_AIRTOUCH, CONTROL_MESSAGE_ID, payload)
+            writer: asyncio.StreamWriter | None = None
+            try:
+                async with asyncio.timeout(self._deadline):
+                    _, writer = await asyncio.open_connection(self._host, self._port)
+                    writer.write(frame)
+                    await writer.drain()
+            except (OSError, TimeoutError) as err:
+                if writer is None:
+                    raise
+                raise ConsoleSendUncertainError("frame may have arrived") from err
+            finally:
+                if writer is not None:
+                    await _close_writer_preserving_cancellation(writer)
+
+    def _next_frame(
+        self, to_address: int, message_id: int, payload: bytes
+    ) -> tuple[At5Header, bytes]:
+        packet_id = self._packet_id
+        self._packet_id = 1 if packet_id == _PACKET_ID_MAX else packet_id + 1
+        header = At5Header(
+            to_address=to_address,
+            from_address=ADDRESS_CLIENT,
+            packet_id=packet_id,
+            message_id=message_id,
+            message_length=len(payload),
+        )
+        return header, encode_frame(header, payload)
 
     async def _exchange(
         self,
@@ -128,19 +200,11 @@ class ConsoleClient:
         to_address: int,
         message_id: int,
         payload: bytes,
-        echo_prefix: bytes | None,
-    ) -> bytes:
+        reply_prefix: bytes,
+        broadcast_prefix: bytes | None,
+    ) -> tuple[bytes, bytes | None]:
         async with self._lock:
-            packet_id = self._packet_id
-            self._packet_id = 1 if packet_id == _PACKET_ID_MAX else packet_id + 1
-            header = At5Header(
-                to_address=to_address,
-                from_address=ADDRESS_CLIENT,
-                packet_id=packet_id,
-                message_id=message_id,
-                message_length=len(payload),
-            )
-            frame = encode_frame(header, payload)
+            request, frame = self._next_frame(to_address, message_id, payload)
             writer: asyncio.StreamWriter | None = None
             try:
                 async with asyncio.timeout(self._deadline):
@@ -152,10 +216,9 @@ class ConsoleClient:
                     try:
                         return await _read_matching(
                             reader,
-                            packet_id=packet_id,
-                            message_id=message_id,
-                            from_address=to_address,
-                            echo_prefix=echo_prefix,
+                            request=request,
+                            reply_prefix=reply_prefix,
+                            broadcast_prefix=broadcast_prefix,
                         )
                     except (asyncio.IncompleteReadError, OSError) as err:
                         raise ConsoleProtocolError("connection closed") from err
@@ -241,23 +304,30 @@ async def _read_frame(reader: asyncio.StreamReader) -> tuple[At5Header, bytes]:
 async def _read_matching(
     reader: asyncio.StreamReader,
     *,
-    packet_id: int,
-    message_id: int,
-    from_address: int,
-    echo_prefix: bytes | None,
-) -> bytes:
+    request: At5Header,
+    reply_prefix: bytes,
+    broadcast_prefix: bytes | None,
+) -> tuple[bytes, bytes | None]:
+    broadcast: bytes | None = None
     while True:
         header, payload = await _read_frame(reader)
         if (
-            header.to_address == ADDRESS_CLIENT
-            and header.from_address == from_address
-            and header.packet_id == packet_id
-            and header.message_id == message_id
-            and (echo_prefix is None or payload.startswith(echo_prefix))
+            header.to_address == request.from_address
+            and header.from_address == request.to_address
+            and header.packet_id == request.packet_id
+            and header.message_id == request.message_id
+            and payload.startswith(reply_prefix)
         ):
-            if echo_prefix is None:
-                return payload
-            return payload[len(echo_prefix) :]
+            return payload, broadcast
+        if (
+            broadcast_prefix is not None
+            and header.to_address == _ADDRESS_ALL_CLIENTS
+            and header.from_address == ADDRESS_AIRTOUCH_EXTENDED
+            and header.message_id == EXTENDED_MESSAGE_ID
+            and payload.startswith(broadcast_prefix)
+        ):
+            broadcast = payload[len(broadcast_prefix) :]
+            continue
         _LOGGER.debug(
             "Skipping console frame id=%s packet=%s",
             header.message_id,
