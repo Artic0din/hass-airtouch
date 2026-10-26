@@ -65,6 +65,12 @@
         "heat": "Heat"
       }
     },
+    "geofence_transition": {
+      "options": {
+        "enter": "Enter",
+        "exit": "Exit"
+      }
+    },
     "spill_bypass": {
       "options": {
         "spill": "Spill",
@@ -129,6 +135,9 @@
       },
       "programs": {
         "name": "Programs"
+      },
+      "geofence": {
+        "name": "Geofence"
       }
     },
     "number": {
@@ -197,6 +206,24 @@
     "clear_timer": {
       "name": "Clear timer",
       "description": "Clears an AirTouch quick timer."
+    },
+    "post_geofence_presence": {
+      "name": "Post geofence presence",
+      "description": "Sends one enter or exit event to the AirTouch geofence and returns whether the console queued air conditioner commands. Target one console per action.",
+      "fields": {
+        "transition": {
+          "name": "Transition",
+          "description": "Whether the account arrived or left. Each action is sent, even when the account is already in that state."
+        },
+        "identity": {
+          "name": "Identity",
+          "description": "The console account's identity, exactly as stored: 1 to 255 printable ASCII characters, with no comma and no leading or trailing space."
+        },
+        "email": {
+          "name": "Email",
+          "description": "Email to store with the account, in the same format as the identity. Omit it to reuse the email the console holds. Required for a new account."
+        }
+      }
     },
     "set_hvac_mode_only": {
       "name": "Set HVAC mode",

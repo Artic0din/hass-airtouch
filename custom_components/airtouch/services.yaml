@@ -37,3 +37,26 @@ set_timer_from_delay:
       required: true
       selector:
         duration:
+post_geofence_presence:
+  target:
+    entity:
+      integration: airtouch
+      domain: sensor
+  fields:
+    transition:
+      required: true
+      selector:
+        select:
+          options:
+            - "enter"
+            - "exit"
+          translation_key: geofence_transition
+    identity:
+      required: true
+      selector:
+        text:
+    email:
+      required: false
+      selector:
+        text:
+          type: email

@@ -336,6 +336,47 @@ Beam fans are labelled only for codes 0 to 6, because the console's Beam writer 
 
 </details>
 
+### Geofence sensor (`sensor.<console_name>_geofence`)
+An AirTouch 5 console gets one sensor for its own geofence.
+The state is the number of console accounts that are inside.
+The attributes show which air conditioners the console turns on when the first account arrives, which it turns off or sets to Away when the last account leaves, and the console's accounts.
+AirTouch 4 consoles do not get this sensor.
+
+The integration reads the geofence about every minute on its own short connections, and again after each [presence action](#polyaire-airtouch-post-geofence-presence-airtouchpost_geofence_presence).
+When a read fails, the sensor shows `unknown` without attributes rather than an old count.
+It stays available, so a presence action that includes an email still works.
+Climate entities keep using the main console connection, and a failed geofence read does not stop them from loading.
+
+Accounts are shown as the console stores them.
+An account whose identity is not 1 to 255 printable ASCII characters, contains a comma, has a leading or trailing space, or appears more than once has `addressable` set to `false`.
+An action cannot reuse that account's email by omitting the email field.
+Supplying an email explicitly posts to the exact identity in the action, without looking up a reported account.
+Text the console stored in a broken encoding is shown with the replacement character `�`.
+
+Identities and emails are household metadata, not secrets.
+Anyone who can see this sensor's attributes can read them, and actions show them in traces.
+Where Home Assistant supports excluding attributes from history, the `accounts` attribute is not recorded.
+Home Assistant 2023.8 lacks that support and may record identities and emails in history.
+
+<details>
+<summary>States and Attributes</summary>
+
+#### States
+ State | Description
+-------|-------------
+ `<count>` | The number of accounts the console reports inside.
+ `unknown` | The latest geofence read failed.
+
+#### Attributes
+ Attribute | Description
+-----------|-------------
+ `on_ac_indexes` | Air conditioners (counted from 0) the console turns on when the first account arrives.
+ `off_ac_indexes` | Air conditioners (counted from 0) the console turns off when the last account leaves.
+ `away_ac_indexes` | Air conditioners (counted from 0) the console sets to Away when the last account leaves.
+ `accounts` | Each account's `identity`, `email`, whether it is `inside`, and whether it is `addressable` by an action.
+
+</details>
+
 ### :thermometer: Number: Sleep and away targets
 An AirTouch 5 console gets four [**number**][hass-number] entities for the temperatures Sleep and Away use.
 The values belong to the console, not to an individual air conditioner.
@@ -682,6 +723,84 @@ service: airtouch.clear_timer
 target:
   entity_id: time.panasonic_on_timer
 ```
+
+### Polyaire AirTouch: Post Geofence Presence (`airtouch.post_geofence_presence`)
+An action that sends one enter or exit event for a console account, the same kind of event the AirTouch app sends from a phone.
+The console decides what happens next:
+
+1. When the first account enters, the console can turn on the air conditioners in `on_ac_indexes`.
+2. When the last inside account exits, the console can turn off or set to Away the air conditioners in `off_ac_indexes` and `away_ac_indexes`.
+3. The event creates the account if the console does not have it, or stores the email sent with it.
+
+Every action sends exactly one event, even when the account is already in that state.
+A repeated exit while nobody is inside can turn air conditioners off or set Away again.
+The integration never retries an event.
+
+The action must request a response, so scripts and automations need `response_variable`.
+A target with no AirTouch 5 geofence sensor is an error instead of doing nothing.
+Target one console per action.
+If an action targets several consoles and one fails, the action reports that error and the other consoles' replies are lost, even though their events were sent.
+Home Assistant 2023.8 rejects a response-requesting action that matches several consoles before posting any events.
+
+#### Fields
+ Field        | Description
+--------------|-------------
+ `target`     | The AirTouch 5 geofence sensor of one console.
+ `transition` | `enter` or `exit`.
+ `identity`   | The console account's identity, exactly as stored. It is case sensitive and must be 1 to 255 printable ASCII characters, with no comma and no leading or trailing space.
+ `email`      | Optional. The email to store with the account, in the same format. Omit it to reuse the email the console holds, which the integration reads just before sending. A new account needs an email.
+
+#### Response
+The response holds `commands_queued` for each targeted sensor.
+`true` means the console queued air conditioner commands.
+It does not confirm that an air conditioner changed or that the console saved the account.
+`false` is a normal reply, for example when another account is still inside or no air conditioner is configured.
+
+#### Errors
+The action fails without sending anything when a field is invalid, when the email is omitted and the console has no single account with that identity and a usable email, or when the console's accounts cannot be read.
+If the event exchange started but no valid reply arrived, the action fails with an error saying the console may have received it.
+This is conservative, including a failed connection where the event did not arrive.
+Check the geofence sensor to see what the console reports.
+
+#### Examples
+Register a new account and mark it outside.
+Like any exit, this can turn air conditioners off or set Away when nobody is inside.
+```yaml
+service: airtouch.post_geofence_presence
+target:
+  entity_id: sensor.console_geofence
+data:
+  transition: exit
+  identity: alex-phone
+  email: alex@example.com
+response_variable: geofence_reply
+```
+
+Mark an existing account inside, reusing its stored email.
+```yaml
+service: airtouch.post_geofence_presence
+target:
+  entity_id: sensor.console_geofence
+data:
+  transition: enter
+  identity: alex-phone
+response_variable: geofence_reply
+```
+
+Mark the account outside again.
+```yaml
+service: airtouch.post_geofence_presence
+target:
+  entity_id: sensor.console_geofence
+data:
+  transition: exit
+  identity: alex-phone
+response_variable: geofence_reply
+```
+
+`{{ geofence_reply['sensor.console_geofence'].commands_queued }}` reads the reply in a later step.
+If you send these from an automation, send `exit` only for a real departure.
+A person or tracker that is `unknown` or `unavailable` has not left home.
 
 ## :hammer_and_wrench: Automation Blueprints
 

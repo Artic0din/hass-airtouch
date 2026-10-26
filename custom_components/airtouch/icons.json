@@ -73,6 +73,9 @@
     "sensor": {
       "programs": {
         "default": "mdi:calendar-clock"
+      },
+      "geofence": {
+        "default": "mdi:home-account"
       }
     },
     "switch": {
@@ -92,6 +95,7 @@
   },
   "services": {
     "clear_timer": "mdi:fan-clock",
+    "post_geofence_presence": "mdi:map-marker-account",
     "set_hvac_mode_only": "mdi:thermostat",
     "set_timer_from_duration": "mdi:fan-clock"
   }
