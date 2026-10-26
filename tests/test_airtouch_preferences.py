@@ -38,7 +38,9 @@ from custom_components.airtouch.preferences import (
     PreferenceRejectedError,
     PreferenceSnapshot,
     parse_preference_report,
+    whole_degrees,
 )
+from custom_components.airtouch.smart_settings import async_install, async_release
 
 _OUTER = b"\x55\x55\x55\xab"
 _ENCODER = HeaderEncoder()
@@ -196,6 +198,15 @@ class _Device:
 
 
 class PreferenceReportTests(unittest.TestCase):
+    def test_whole_degree_validation_exception_types(self) -> None:
+        for value in (True, None, "21"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                whole_degrees(value)
+        for invalid_number in (21.25, float("nan"), float("inf")):
+            with self.subTest(value=invalid_number), self.assertRaises(ValueError):
+                whole_degrees(invalid_number)
+        self.assertEqual(whole_degrees(20.999999999999996), 21)
+
     def test_sentinels_and_retained_prefix(self) -> None:
         prefix = bytearray(_console_prefix())
         prefix[22] = 0
@@ -561,7 +572,15 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added, [[]])
         self.assertEqual(self.connections, 0)
         self.mode = "truncate"
-        self.hass.data[DOMAIN][self.entry.entry_id] = _AirTouch()
+        live = _AirTouch()
+        self.hass.data[DOMAIN][self.entry.entry_id] = live
+        installed = async_install(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", live),
+            port=self.port,
+        )
+        self.assertIsNotNone(installed)
         with patch(
             "custom_components.airtouch.number.devices.AirTouchDevice",
             return_value=_Device(),
@@ -580,9 +599,19 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
                 "hub_sleep_heat",
             ],
         )
+        self.assertEqual(
+            sorted(entity.unique_id for entity in added[2]),
+            [
+                "hub_weather_adaptation_cool_differential",
+                "hub_weather_adaptation_cool_target",
+                "hub_weather_adaptation_heat_differential",
+                "hub_weather_adaptation_heat_target",
+            ],
+        )
         number = added[1][0]
         assert isinstance(number, PreferenceNumber)
         await number.coordinator.async_shutdown()
+        await async_release(cast("Any", self.hass), self.entry.entry_id)
 
     async def test_unload_stops_later_refreshes(self) -> None:
         coordinator = self._coordinator()

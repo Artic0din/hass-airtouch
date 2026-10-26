@@ -140,11 +140,32 @@
       },
       "away_maximum": {
         "name": "Away maximum"
+      },
+      "weather_adaptation_cool_differential": {
+        "name": "Weather adaptation cool differential"
+      },
+      "weather_adaptation_cool_target": {
+        "name": "Weather adaptation cool target"
+      },
+      "weather_adaptation_heat_differential": {
+        "name": "Weather adaptation heat differential"
+      },
+      "weather_adaptation_heat_target": {
+        "name": "Weather adaptation heat target"
       }
     },
     "switch": {
       "energy_wastage_detection": {
         "name": "Energy wastage detection"
+      },
+      "weather_adaptation_advanced": {
+        "name": "Advanced weather adaptation"
+      },
+      "weather_adaptation_basic": {
+        "name": "Weather adaptation"
+      },
+      "weather_adaptation_auto_off": {
+        "name": "Weather adaptation auto off"
       }
     }
   },

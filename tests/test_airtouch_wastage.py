@@ -7,19 +7,26 @@ import struct
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from logging import Logger
 
+    from homeassistant.components.number import NumberEntity
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity import Entity
 
-from homeassistant.const import CONF_HOST
+from homeassistant.components import number as number_component
+from homeassistant.components.number import NumberDeviceClass, NumberMode
+from homeassistant.const import CONF_HOST, UnitOfTemperature
+from homeassistant.core import ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util.unit_conversion import TemperatureConverter
+from homeassistant.util.unit_system import METRIC_SYSTEM, US_CUSTOMARY_SYSTEM
 from pyairtouch import AirTouchModel
 from pyairtouch.at5.comms.hdr import (
     ADDRESS_AIRTOUCH_EXTENDED,
@@ -40,7 +47,10 @@ from custom_components.airtouch import (
 from custom_components.airtouch.console import DEFAULT_DEADLINE, ConsoleClient
 from custom_components.airtouch.const import CONF_AIRTOUCH_MODEL, DOMAIN
 from custom_components.airtouch.const import AirTouchModel as SelectedModel
+from custom_components.airtouch.number import SmartSettingNumber
 from custom_components.airtouch.smart_settings import (
+    SmartFlag,
+    SmartNumber,
     SmartSettingsCoordinator,
     SmartSettingsParseError,
     SmartSettingsRejectedError,
@@ -51,8 +61,8 @@ from custom_components.airtouch.smart_settings import (
     parse_smart_settings,
 )
 from custom_components.airtouch.switch import (
-    EnergyWastageSwitch,
-    async_collect_energy_wastage_switches,
+    SmartSettingSwitch,
+    async_collect_smart_setting_switches,
     async_setup_entry,
 )
 
@@ -184,6 +194,7 @@ class _Hass:
 class _Config:
     def __init__(self) -> None:
         self.time_zone = "UTC"
+        self.units: Any = None
 
 
 class _AirTouch:
@@ -204,6 +215,12 @@ class _Device:
 
     def __init__(self) -> None:
         self.device_info = _DEVICE_INFO
+
+
+class _NumberServiceModule(Protocol):
+    async def async_set_value(
+        self, entity: NumberEntity, service_call: ServiceCall
+    ) -> None: ...
 
 
 class SmartSettingsParseTests(unittest.TestCase):
@@ -231,7 +248,7 @@ class SmartSettingsParseTests(unittest.TestCase):
         )
         snapshot = parse_smart_settings(_SAMPLE_PAYLOAD[2:])
         self.assertEqual(snapshot.info, _SAMPLE_INFO)
-        self.assertFalse(snapshot.energy_wastage)
+        self.assertFalse(snapshot.flag(SmartFlag.ENERGY_WASTAGE))
         self.assertNotIn(_RECORDS, snapshot.info)
         self.assertEqual(snapshot.info[1:5], bytes.fromhex("051b0412"))
 
@@ -242,12 +259,12 @@ class SmartSettingsParseTests(unittest.TestCase):
         info[7] = 0xC2
         body = bytes((8, 5, 2)) + bytes(info) + _RECORDS
         snapshot = parse_smart_settings(body)
-        self.assertTrue(snapshot.energy_wastage)
+        self.assertTrue(snapshot.flag(SmartFlag.ENERGY_WASTAGE))
         self.assertEqual(snapshot.info[6:], bytes.fromhex("b1c2"))
         extended = _RICH_INFO
         parsed = parse_smart_settings(bytes((len(extended), 0, 2)) + extended)
         self.assertEqual(parsed.info, extended)
-        self.assertFalse(parsed.energy_wastage)
+        self.assertFalse(parsed.flag(SmartFlag.ENERGY_WASTAGE))
         quiet = parse_smart_settings(bytes((len(_SAMPLE_INFO), 0, 0)) + _SAMPLE_INFO)
         self.assertEqual(quiet.info, _SAMPLE_INFO)
 
@@ -321,8 +338,18 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.coordinators.append(coordinator)
         return coordinator
 
-    def _switch(self, coordinator: SmartSettingsCoordinator) -> EnergyWastageSwitch:
-        return EnergyWastageSwitch(coordinator, "hub", cast("Any", _DEVICE_INFO))
+    def _switch(self, coordinator: SmartSettingsCoordinator) -> SmartSettingSwitch:
+        return self._flag(coordinator, SmartFlag.ENERGY_WASTAGE)
+
+    def _flag(
+        self, coordinator: SmartSettingsCoordinator, field: SmartFlag
+    ) -> SmartSettingSwitch:
+        return SmartSettingSwitch(coordinator, "hub", cast("Any", _DEVICE_INFO), field)
+
+    def _number(
+        self, coordinator: SmartSettingsCoordinator, field: SmartNumber
+    ) -> SmartSettingNumber:
+        return SmartSettingNumber(coordinator, "hub", cast("Any", _DEVICE_INFO), field)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -527,7 +554,9 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.mode = "ok"
         before = self.connections
         with self.assertRaises(SmartSettingsRejectedError):
-            await coordinator.async_set(enabled=cast("bool", 1))
+            await coordinator.async_set_flag(
+                SmartFlag.ENERGY_WASTAGE, enabled=cast("bool", 1)
+            )
         self.assertEqual(self.connections, before)
 
     async def test_state_stays_off_until_readback_matches(self) -> None:
@@ -657,7 +686,7 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, b"\xff\x812510")
 
     async def test_airtouch_4_failed_setup_and_unload(self) -> None:
-        entities = await async_collect_energy_wastage_switches(
+        entities = await async_collect_smart_setting_switches(
             cast("Any", self.hass),
             cast("Any", self.entry),
             cast("Any", _AirTouch(AirTouchModel.AIRTOUCH_4)),
@@ -704,9 +733,21 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
                 cast("Any", self.hass), cast("Any", self.entry), add_entities
             )
         self.assertEqual(self.connections, seen)
-        self.assertEqual(len(added[1]), 1)
-        switch = added[1][0]
-        assert isinstance(switch, EnergyWastageSwitch)
+        self.assertEqual(
+            sorted(entity.unique_id for entity in added[1]),
+            [
+                "hub_energy_wastage_detection",
+                "hub_weather_adaptation_advanced",
+                "hub_weather_adaptation_auto_off",
+                "hub_weather_adaptation_basic",
+            ],
+        )
+        switch = next(
+            entity
+            for entity in added[1]
+            if entity.unique_id == "hub_energy_wastage_detection"
+        )
+        assert isinstance(switch, SmartSettingSwitch)
         self.assertFalse(switch.available)
         self.assertEqual(switch.unique_id, "hub_energy_wastage_detection")
         self.assertIs(switch.coordinator, installed)
@@ -1154,6 +1195,316 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
             get_smart_settings(cast("Any", self.hass), at4.entry_id)
         self.assertIs(self.hass.data[DOMAIN][at4.entry_id], fourth)
 
+    def _assert_info_write(self, info: bytes) -> None:
+        payload = self.writes[-1]
+        self.assertEqual(payload, bytes((0xFF, 0x18, len(info), 0, 0)) + info)
+        self.assertEqual(len(payload), 5 + len(info))
+        self.assertNotIn(_RECORDS, payload)
+        self.assertEqual(self.info, info)
+
+    async def test_native_coupling_reports_the_console_flags(self) -> None:
+        self.info = _SAMPLE_INFO
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        basic = self._flag(coordinator, SmartFlag.BASIC)
+        auto = self._flag(coordinator, SmartFlag.AUTO_OFF)
+        self.assertFalse(basic.is_on)
+        self.assertTrue(auto.is_on)
+        self.assertEqual(self.writes, [])
+
+        self.info = bytes.fromhex("00051b0412000101")
+        await coordinator.async_refresh()
+        await basic.async_turn_off()
+        self._assert_info_write(bytes.fromhex("00051b0412000000"))
+        self.assertFalse(auto.is_on)
+        await auto.async_turn_on()
+        self._assert_info_write(bytes.fromhex("00051b0412000101"))
+        self.assertTrue(basic.is_on)
+
+        advanced = self._flag(coordinator, SmartFlag.ADVANCED)
+        wastage = self._switch(coordinator)
+        await advanced.async_turn_on()
+        self._assert_info_write(bytes.fromhex("01051b0412000101"))
+        await wastage.async_turn_on()
+        self._assert_info_write(bytes.fromhex("01051b0412010101"))
+        self.assertTrue(auto.is_on)
+        self.assertTrue(advanced.is_on)
+        self.assertTrue(wastage.is_on)
+        self.assertTrue(basic.is_on)
+
+    async def test_shared_owner_does_not_lose_updates(self) -> None:
+        self.info = bytes.fromhex("00051b0412000000")
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        wastage = self._switch(coordinator)
+        cool = self._number(coordinator, SmartNumber.COOL_TARGET)
+        advanced = self._flag(coordinator, SmartFlag.ADVANCED)
+        self.hold_connection = 2
+        first = asyncio.create_task(wastage.async_turn_on())
+        await asyncio.wait_for(self.started.wait(), 1)
+        second = asyncio.create_task(cool.async_set_native_value(21))
+        third = asyncio.create_task(advanced.async_turn_on())
+        poll = asyncio.create_task(coordinator.async_refresh())
+        await asyncio.sleep(0.05)
+        self.assertFalse(second.done())
+        self.assertEqual(self.connections, 2)
+        self.assertEqual(self.max_active, 1)
+        self.release.set()
+        await asyncio.wait_for(asyncio.gather(first, second, third, poll), 2)
+        self.assertEqual(self.info, bytes.fromhex("0105150412010000"))
+        self.assertEqual(
+            [payload[5:] for payload in self.writes],
+            [
+                bytes.fromhex("00051b0412010000"),
+                bytes.fromhex("0005150412010000"),
+                bytes.fromhex("0105150412010000"),
+            ],
+        )
+        for payload in self.writes:
+            self.assertEqual(payload[:2], b"\xff\x18")
+            self.assertEqual(payload[3:5], b"\x00\x00")
+            self.assertEqual(len(payload), 5 + payload[2])
+            self.assertNotIn(_RECORDS, payload)
+        self.assertTrue(wastage.is_on)
+        self.assertEqual(cool.native_value, 21)
+        self.assertTrue(advanced.is_on)
+        decoded = [_oracle_decode(raw) for raw in self.raw]
+        header, payload = next(
+            item for item in reversed(decoded) if len(item[1]) > len(_QUERY)
+        )
+        self.assertEqual((header.to_address, header.from_address), (0x90, 0xB0))
+        self.assertEqual(header.message_id, 0x1F)
+        self.assertEqual(payload, self.writes[-1])
+        self.assertEqual(len(payload), 5 + payload[2])
+
+    async def test_short_extended_and_noncanonical_bytes_are_retained(self) -> None:
+        self.info = bytes.fromhex("01051b041201")
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        basic = self._flag(coordinator, SmartFlag.BASIC)
+        auto = self._flag(coordinator, SmartFlag.AUTO_OFF)
+        wastage = self._switch(coordinator)
+        cool = self._number(coordinator, SmartNumber.COOL_TARGET)
+        self.assertFalse(basic.available)
+        self.assertIsNone(basic.is_on)
+        self.assertFalse(auto.available)
+        self.assertTrue(wastage.is_on)
+        self.assertEqual(cool.native_value, 0x1B)
+        await wastage.async_turn_off()
+        self._assert_info_write(bytes.fromhex("01051b041200"))
+
+        self.info = bytes.fromhex("01051b04120100")
+        await coordinator.async_refresh()
+        self.assertFalse(basic.available)
+        self.assertFalse(auto.available)
+        await wastage.async_turn_off()
+        self._assert_info_write(bytes.fromhex("01051b04120000"))
+
+        self.info = bytes.fromhex("a10318031402b1c2d3e4")
+        await coordinator.async_refresh()
+        self.assertTrue(wastage.is_on)
+        await cool.async_set_native_value(21)
+        self.assertEqual(self.info[2], 21)
+        self.assertEqual(self.info[5], 0x02)
+        self.assertEqual(self.info[8:], bytes.fromhex("d3e4"))
+        self.assertNotIn(_RECORDS, self.writes[-1])
+        self.assertEqual(len(self.writes[-1]), 15)
+
+    async def test_invalid_numbers_and_flags_do_not_connect(self) -> None:
+        self.info = bytes.fromhex("00051b0412000000")
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        cool = self._number(coordinator, SmartNumber.COOL_TARGET)
+        differential = self._number(coordinator, SmartNumber.COOL_DIFFERENTIAL)
+        before = self.connections
+        for entity, value in (
+            (cool, 21.01),
+            (cool, float("nan")),
+            (cool, float("inf")),
+            (cool, float("-inf")),
+            (cool, 15),
+            (cool, 33),
+            (differential, -1),
+            (differential, 16),
+        ):
+            with self.subTest(value=value), self.assertRaises(HomeAssistantError):
+                await entity.async_set_native_value(value)
+        invalid_bool: object = True
+        with self.assertRaises(HomeAssistantError):
+            await cool.async_set_native_value(cast("float", invalid_bool))
+        with self.assertRaises(SmartSettingsRejectedError):
+            await coordinator.async_set_flag(
+                SmartFlag.ADVANCED, enabled=cast("bool", 1)
+            )
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(cool.native_value, 0x1B)
+
+    async def test_number_units_endpoints_and_stored_advanced_state(self) -> None:
+        self.info = bytes.fromhex("00001b0012000000")
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        cool_diff = self._number(coordinator, SmartNumber.COOL_DIFFERENTIAL)
+        heat_diff = self._number(coordinator, SmartNumber.HEAT_DIFFERENTIAL)
+        cool = self._number(coordinator, SmartNumber.COOL_TARGET)
+        heat = self._number(coordinator, SmartNumber.HEAT_TARGET)
+        advanced = self._flag(coordinator, SmartFlag.ADVANCED)
+        self.hass.config.units = US_CUSTOMARY_SYSTEM
+
+        platform = cast(
+            "Any",
+            SimpleNamespace(
+                platform_name="airtouch",
+                domain="number",
+                default_language_platform_translations={},
+            ),
+        )
+        for entity in (cool, heat, cool_diff, heat_diff):
+            entity.hass = cast("Any", self.hass)
+            entity.platform = platform
+        self.assertEqual(cool.device_class, NumberDeviceClass.TEMPERATURE)
+        self.assertEqual(cool.native_unit_of_measurement, UnitOfTemperature.CELSIUS)
+        self.assertEqual(cool.unit_of_measurement, UnitOfTemperature.FAHRENHEIT)
+        self.assertEqual(cool.native_min_value, 16)
+        self.assertEqual(cool.native_max_value, 32)
+        self.assertEqual(cool.step, 1.8)
+        self.assertEqual(cool.mode, NumberMode.BOX)
+        self.assertIsNone(cool_diff.device_class)
+        self.assertEqual(
+            cool_diff.native_unit_of_measurement, UnitOfTemperature.CELSIUS
+        )
+        self.assertEqual(cool_diff.unit_of_measurement, UnitOfTemperature.CELSIUS)
+        self.assertEqual(cool_diff.native_min_value, 0)
+        self.assertEqual(cool_diff.native_max_value, 15)
+        self.assertEqual(cool_diff.convert_to_native_value(10), 10)
+        native = TemperatureConverter.convert(
+            69.8, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
+        )
+        self.assertEqual(cool.convert_to_native_value(69.8), native)
+        await cool.async_set_native_value(native)
+        self.assertEqual(cool.native_value, 21)
+        self.assertEqual(self.info[2], 21)
+        self.assertEqual(self.info[0], 0)
+        self.assertFalse(advanced.is_on)
+        assert cool.value is not None
+        await cast("_NumberServiceModule", number_component).async_set_value(
+            cool,
+            ServiceCall(
+                cast("Any", self.hass),
+                "number",
+                "set_value",
+                {"value": cool.value + cool.step},
+            ),
+        )
+        self.assertEqual(cool.native_value, 22)
+        self.assertEqual(self.info[2], 22)
+        self.assertEqual(cool_diff.step, 1)
+        self.hass.config.units = METRIC_SYSTEM
+        self.assertEqual(cool.step, 1)
+        self.assertEqual(cool_diff.step, 1)
+        await cool.async_set_native_value(32)
+        self.assertEqual(self.info[2], 32)
+        await cool_diff.async_set_native_value(0)
+        self.assertEqual(self.info[1], 0)
+        await heat_diff.async_set_native_value(15)
+        self.assertEqual(self.info[3], 15)
+        await heat.async_set_native_value(16)
+        self.assertEqual(self.info[4], 16)
+
+    async def test_disabled_differential_blocks_other_fields_until_replaced(
+        self,
+    ) -> None:
+        info = bytearray.fromhex("00051b0412000000")
+        info[1] = 0xFF
+        self.info = bytes(info)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        cool = self._number(coordinator, SmartNumber.COOL_DIFFERENTIAL)
+        heat = self._number(coordinator, SmartNumber.HEAT_DIFFERENTIAL)
+        target = self._number(coordinator, SmartNumber.COOL_TARGET)
+        wastage = self._switch(coordinator)
+        advanced = self._flag(coordinator, SmartFlag.ADVANCED)
+        stored = coordinator.data
+        self.assertTrue(cool.available)
+        self.assertIsNone(cool.native_value)
+        self.assertEqual(heat.native_value, 4)
+        self.assertEqual(target.native_value, 0x1B)
+        self.assertTrue(wastage.available)
+        self.assertTrue(advanced.available)
+        before = len(self.writes)
+        with self.assertRaisesRegex(
+            HomeAssistantError, "disabled weather differential"
+        ):
+            await wastage.async_turn_on()
+        with self.assertRaisesRegex(
+            HomeAssistantError, "disabled weather differential"
+        ):
+            await advanced.async_turn_on()
+        with self.assertRaisesRegex(
+            HomeAssistantError, "disabled weather differential"
+        ):
+            await target.async_set_native_value(20)
+        with self.assertRaisesRegex(
+            HomeAssistantError, "disabled weather differential"
+        ):
+            await heat.async_set_native_value(3)
+        self.assertEqual(len(self.writes), before)
+        self.assertEqual(self.info[1], 0xFF)
+        self.assertIs(coordinator.data, stored)
+        await cool.async_set_native_value(5)
+        self.assertEqual(self.info[1], 5)
+        self.assertEqual(self.info[3], 4)
+        self.assertEqual(cool.native_value, 5)
+        await wastage.async_turn_on()
+        self.assertTrue(wastage.is_on)
+
+        other = bytearray.fromhex("0000000412000000")
+        other[3] = 0xFF
+        self.info = bytes(other)
+        await coordinator.async_refresh()
+        self.assertTrue(heat.available)
+        self.assertIsNone(heat.native_value)
+        self.assertEqual(cool.native_value, 0)
+        with self.assertRaisesRegex(
+            HomeAssistantError, "disabled weather differential"
+        ):
+            await cool.async_set_native_value(1)
+        self.assertEqual(self.info[3], 0xFF)
+        self.assertEqual(cool.native_value, 0)
+        await heat.async_set_native_value(0)
+        self.assertEqual(self.info[3], 0)
+        self.assertEqual(self.info[1], 0)
+
+    async def test_unknown_numeric_values_remain_editable(self) -> None:
+        self.info = bytes.fromhex("00101bff12000100")
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        cool_diff = self._number(coordinator, SmartNumber.COOL_DIFFERENTIAL)
+        heat_diff = self._number(coordinator, SmartNumber.HEAT_DIFFERENTIAL)
+        cool = self._number(coordinator, SmartNumber.COOL_TARGET)
+        basic = self._flag(coordinator, SmartFlag.BASIC)
+        auto = self._flag(coordinator, SmartFlag.AUTO_OFF)
+        wastage = self._switch(coordinator)
+        self.assertTrue(coordinator.last_update_success)
+        self.assertTrue(cool_diff.available)
+        self.assertIsNone(cool_diff.native_value)
+        self.assertTrue(heat_diff.available)
+        self.assertIsNone(heat_diff.native_value)
+        self.assertEqual(cool.native_value, 0x1B)
+        self.assertTrue(basic.is_on)
+        self.assertFalse(auto.is_on)
+        self.assertFalse(wastage.is_on)
+
+        self.info = bytes.fromhex("00050f0412000000")
+        await coordinator.async_refresh()
+        self.assertTrue(cool.available)
+        self.assertIsNone(cool.native_value)
+        self.assertEqual(cool_diff.native_value, 5)
+        self.assertTrue(wastage.available)
+        self.assertTrue(basic.available)
+        await cool.async_set_native_value(20)
+        self.assertEqual(cool.native_value, 20)
+
 
 class _Api:
     def __init__(self, model: AirTouchModel) -> None:
@@ -1212,19 +1563,54 @@ class WastageMetadataTests(unittest.TestCase):
         strings = json.loads((_COMPONENT / "strings.json").read_text())
         english = json.loads((_COMPONENT / "translations" / "en.json").read_text())
         icons = json.loads((_COMPONENT / "icons.json").read_text())
-        name = "Energy wastage detection"
-        self.assertEqual(
-            strings["entity"]["switch"]["energy_wastage_detection"]["name"],
-            name,
-        )
-        self.assertEqual(
-            english["entity"]["switch"]["energy_wastage_detection"]["name"],
-            name,
-        )
-        self.assertEqual(
-            icons["entity"]["switch"]["energy_wastage_detection"]["default"],
-            "mdi:window-open",
-        )
+        self.assertEqual(strings["entity"], english["entity"])
+        switches = {
+            "energy_wastage_detection": (
+                "Energy wastage detection",
+                "mdi:window-open",
+            ),
+            "weather_adaptation_advanced": (
+                "Advanced weather adaptation",
+                "mdi:weather-partly-cloudy",
+            ),
+            "weather_adaptation_basic": ("Weather adaptation", "mdi:weather-sunny"),
+            "weather_adaptation_auto_off": (
+                "Weather adaptation auto off",
+                "mdi:power-plug-off",
+            ),
+        }
+        numbers = {
+            "sleep_cool": "Sleep cool",
+            "sleep_heat": "Sleep heat",
+            "away_minimum": "Away minimum",
+            "away_maximum": "Away maximum",
+            "weather_adaptation_cool_differential": (
+                "Weather adaptation cool differential"
+            ),
+            "weather_adaptation_cool_target": "Weather adaptation cool target",
+            "weather_adaptation_heat_differential": (
+                "Weather adaptation heat differential"
+            ),
+            "weather_adaptation_heat_target": "Weather adaptation heat target",
+        }
+        number_icons = {
+            "sleep_cool": "mdi:snowflake",
+            "sleep_heat": "mdi:fire",
+            "away_minimum": "mdi:thermometer-low",
+            "away_maximum": "mdi:thermometer-high",
+            "weather_adaptation_cool_differential": "mdi:thermometer-minus",
+            "weather_adaptation_heat_differential": "mdi:thermometer-plus",
+            "weather_adaptation_cool_target": "mdi:snowflake-thermometer",
+            "weather_adaptation_heat_target": "mdi:sun-thermometer",
+        }
+        for key, (name, icon) in switches.items():
+            self.assertEqual(strings["entity"]["switch"][key]["name"], name)
+            self.assertEqual(icons["entity"]["switch"][key]["default"], icon)
+        for key, name in numbers.items():
+            self.assertEqual(strings["entity"]["number"][key]["name"], name)
+            self.assertEqual(
+                icons["entity"]["number"][key]["default"], number_icons[key]
+            )
 
 
 if __name__ == "__main__":

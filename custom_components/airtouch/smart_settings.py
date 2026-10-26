@@ -11,7 +11,8 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final, cast
+from enum import Enum
+from typing import TYPE_CHECKING, Final, assert_never, cast
 
 from homeassistant.config_entries import current_entry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from pyairtouch import AirTouch
 
 from .console import DEFAULT_DEADLINE, ConsoleClient, ConsoleProtocolError
+from .preferences import whole_degrees
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,16 +58,118 @@ class SmartSettingsParseError(Exception):
 
 
 class SmartSettingsRejectedError(Exception):
-    """The requested energy-wastage value was not on or off."""
+    """The requested smart-settings value was not accepted."""
 
 
 class SmartSettingsExchangeError(Exception):
     """The console did not complete a read or a confirmed write."""
 
 
+class SmartFlag(Enum):
+    """One byte that the console reports as off at zero and on otherwise."""
+
+    ADVANCED = "weather_adaptation_advanced"
+    ENERGY_WASTAGE = "energy_wastage_detection"
+    BASIC = "weather_adaptation_basic"
+    AUTO_OFF = "weather_adaptation_auto_off"
+
+
+class SmartNumber(Enum):
+    """One console byte stored as a whole number of degrees Celsius."""
+
+    COOL_DIFFERENTIAL = "weather_adaptation_cool_differential"
+    COOL_TARGET = "weather_adaptation_cool_target"
+    HEAT_DIFFERENTIAL = "weather_adaptation_heat_differential"
+    HEAT_TARGET = "weather_adaptation_heat_target"
+
+
+@dataclass(frozen=True, slots=True)
+class SmartNumberRange:
+    """Inclusive Celsius bounds and whether Home Assistant converts them."""
+
+    minimum: int
+    maximum: int
+    absolute: bool
+
+
+SMART_NUMBER_RANGES: Final[dict[SmartNumber, SmartNumberRange]] = {
+    SmartNumber.COOL_DIFFERENTIAL: SmartNumberRange(0, 15, absolute=False),
+    SmartNumber.HEAT_DIFFERENTIAL: SmartNumberRange(0, 15, absolute=False),
+    SmartNumber.COOL_TARGET: SmartNumberRange(16, 32, absolute=True),
+    SmartNumber.HEAT_TARGET: SmartNumberRange(16, 32, absolute=True),
+}
+
+_FLAG_INDEX: Final[dict[SmartFlag, int]] = {
+    SmartFlag.ADVANCED: 0,
+    SmartFlag.ENERGY_WASTAGE: _ENERGY_INDEX,
+    SmartFlag.BASIC: 6,
+    SmartFlag.AUTO_OFF: 7,
+}
+_NUMBER_INDEX: Final[dict[SmartNumber, int]] = {
+    SmartNumber.COOL_DIFFERENTIAL: 1,
+    SmartNumber.COOL_TARGET: 2,
+    SmartNumber.HEAT_DIFFERENTIAL: 3,
+    SmartNumber.HEAT_TARGET: 4,
+}
+# The console applies basic and auto-off only when the information length is
+# greater than 7. A shorter report is left as received.
+_FLAG_PAIR_LENGTH: Final = 8
+
+
+def _flag_present(info: bytes, field: SmartFlag) -> bool:
+    match field:
+        case SmartFlag.ADVANCED | SmartFlag.ENERGY_WASTAGE:
+            return _FLAG_INDEX[field] < len(info)
+        case SmartFlag.BASIC | SmartFlag.AUTO_OFF:
+            return len(info) >= _FLAG_PAIR_LENGTH
+        case unreachable:
+            assert_never(unreachable)
+
+
+def _flag_changes(field: SmartFlag, *, enabled: bool) -> tuple[tuple[int, int], ...]:
+    value = _ENABLED_BYTE if enabled else _DISABLED_BYTE
+    match field:
+        case SmartFlag.ADVANCED | SmartFlag.ENERGY_WASTAGE:
+            return ((_FLAG_INDEX[field], value),)
+        case SmartFlag.BASIC:
+            if enabled:
+                return ((_FLAG_INDEX[SmartFlag.BASIC], value),)
+            return (
+                (_FLAG_INDEX[SmartFlag.BASIC], _DISABLED_BYTE),
+                (_FLAG_INDEX[SmartFlag.AUTO_OFF], _DISABLED_BYTE),
+            )
+        case SmartFlag.AUTO_OFF:
+            if enabled:
+                return (
+                    (_FLAG_INDEX[SmartFlag.BASIC], _ENABLED_BYTE),
+                    (_FLAG_INDEX[SmartFlag.AUTO_OFF], _ENABLED_BYTE),
+                )
+            return ((_FLAG_INDEX[SmartFlag.AUTO_OFF], value),)
+        case unreachable:
+            assert_never(unreachable)
+
+
+def _info_with_flags(info: bytes, field: SmartFlag, *, enabled: bool) -> bytes:
+    if not _flag_present(info, field):
+        raise SmartSettingsRejectedError("smart settings omit the requested flag")
+    updated = bytearray(info)
+    for index, value in _flag_changes(field, enabled=enabled):
+        updated[index] = value
+    return bytes(updated)
+
+
+def _info_with_number(info: bytes, field: SmartNumber, value: int) -> bytes:
+    index = _NUMBER_INDEX[field]
+    if index >= len(info):
+        raise SmartSettingsRejectedError("smart settings omit the requested number")
+    updated = bytearray(info)
+    updated[index] = value
+    return bytes(updated)
+
+
 @dataclass(frozen=True, slots=True)
 class SmartSettingsSnapshot:
-    """Information bytes from one reply, including the energy-wastage flag."""
+    """Information bytes from one reply."""
 
     info: bytes
 
@@ -73,16 +177,22 @@ class SmartSettingsSnapshot:
         if len(self.info) < _MINIMUM_INFO_LENGTH:
             raise SmartSettingsParseError("smart settings omit energy wastage")
 
-    @property
-    def energy_wastage(self) -> bool:
-        """Whether the console reported detection as enabled."""
-        return self.info[_ENERGY_INDEX] != _DISABLED_BYTE
+    def flag(self, field: SmartFlag) -> bool | None:
+        """Return the reported flag, or None when this report omits it."""
+        if not _flag_present(self.info, field):
+            return None
+        return self.info[_FLAG_INDEX[field]] != _DISABLED_BYTE
 
-    def with_energy_wastage(self, *, enabled: bool) -> SmartSettingsSnapshot:
-        """Return a copy whose energy-wastage byte is 0 or 1."""
-        info = bytearray(self.info)
-        info[_ENERGY_INDEX] = _ENABLED_BYTE if enabled else _DISABLED_BYTE
-        return SmartSettingsSnapshot(bytes(info))
+    def number(self, field: SmartNumber) -> int | None:
+        """Return one Celsius byte, or None when it is absent or unsupported."""
+        index = _NUMBER_INDEX[field]
+        if index >= len(self.info):
+            return None
+        value = self.info[index]
+        limits = SMART_NUMBER_RANGES[field]
+        if value < limits.minimum or value > limits.maximum:
+            return None
+        return value
 
 
 def parse_smart_settings(body: bytes) -> SmartSettingsSnapshot:
@@ -133,12 +243,28 @@ class SmartSettingsCoordinator(DataUpdateCoordinator[SmartSettingsSnapshot]):
         finally:
             current_entry.reset(token)
 
-    async def async_set(self, *, enabled: bool) -> None:
-        """Change detection after a fresh read and a matching readback."""
+    async def async_set_flag(self, field: SmartFlag, *, enabled: bool) -> None:
+        """Change one flag, including the console's basic and auto-off pairing."""
         if not isinstance(enabled, bool):
-            raise SmartSettingsRejectedError("energy wastage must be on or off")
+            raise SmartSettingsRejectedError("smart settings flag must be on or off")
         await self._async_patch(
-            lambda snapshot: snapshot.with_energy_wastage(enabled=enabled).info
+            lambda snapshot: _info_with_flags(snapshot.info, field, enabled=enabled)
+        )
+
+    async def async_set_number(self, field: SmartNumber, value: float) -> None:
+        """Store one number. Advanced stays as the console last reported it.
+
+        A stored differential or comfort target is used when advanced mode is on.
+        """
+        try:
+            native = whole_degrees(value)
+        except (TypeError, ValueError) as err:
+            raise SmartSettingsRejectedError(str(err)) from err
+        limits = SMART_NUMBER_RANGES[field]
+        if native < limits.minimum or native > limits.maximum:
+            raise SmartSettingsRejectedError("temperature is outside the console range")
+        await self._async_patch(
+            lambda snapshot: _info_with_number(snapshot.info, field, native)
         )
 
     async def async_shutdown(self) -> None:
