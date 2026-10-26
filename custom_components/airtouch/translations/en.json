@@ -141,6 +141,12 @@
       "away_maximum": {
         "name": "Away maximum"
       },
+      "alert_minimum": {
+        "name": "Alert minimum"
+      },
+      "alert_maximum": {
+        "name": "Alert maximum"
+      },
       "weather_adaptation_cool_differential": {
         "name": "Weather adaptation cool differential"
       },

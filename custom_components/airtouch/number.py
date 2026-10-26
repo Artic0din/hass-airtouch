@@ -47,6 +47,8 @@ _SPECS: Final = {
     PreferenceField.SLEEP_HEAT: _FieldSpec("sleep_heat", "Sleep heat"),
     PreferenceField.AWAY_MINIMUM: _FieldSpec("away_minimum", "Away minimum"),
     PreferenceField.AWAY_MAXIMUM: _FieldSpec("away_maximum", "Away maximum"),
+    PreferenceField.ALERT_MINIMUM: _FieldSpec("alert_minimum", "Alert minimum"),
+    PreferenceField.ALERT_MAXIMUM: _FieldSpec("alert_maximum", "Alert maximum"),
 }
 
 _NUMBER_NAMES: Final[dict[SmartNumber, str]] = {
@@ -101,7 +103,7 @@ async def async_collect_preference_numbers(
     unique_id: str,
     device_info: DeviceInfo,
 ) -> list[NumberEntity]:
-    """Create the four console numbers for an AirTouch 5.
+    """Create the console temperature numbers for an AirTouch 5.
 
     The numbers share the owner installed for this entry. Other models get no
     numbers. A failed preference read does not fail platform setup.
@@ -158,7 +160,10 @@ class PreferenceNumber(CoordinatorEntity[PreferenceCoordinator], NumberEntity):
         data = self.coordinator.data
         if data is None:
             return None
-        return float(data.value(self._field))
+        reported = data.value(self._field)
+        if reported is None:
+            return None
+        return float(reported)
 
     async def async_set_native_value(self, value: float) -> None:
         try:

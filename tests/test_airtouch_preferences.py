@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import struct
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
@@ -353,6 +355,62 @@ class PreferenceReportTests(unittest.TestCase):
         masked = bytearray(_console_prefix())
         decoded_mask = parse_preference_report(_report(bytes(masked)))
         self.assertEqual(decoded_mask.sleep_cool_c, 32)
+
+    def test_enabled_zero_is_distinct_from_disabled_lower_bits(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 0x80
+        prefix[19] = 0x32
+        report = parse_preference_report(_report(bytes(prefix)))
+        self.assertEqual(report.alert_maximum_c, 0)
+        self.assertIsNone(report.alert_minimum_c)
+        self.assertEqual(report.value(PreferenceField.ALERT_MAXIMUM), 0)
+        self.assertIsNone(report.value(PreferenceField.ALERT_MINIMUM))
+        self.assertEqual(report.away_maximum_c, 28)
+        self.assertEqual(report.sleep_cool_c, 32)
+        disabled = bytearray(prefix)
+        disabled[18] = 0x7F
+        disabled[19] = 0x00
+        hidden = parse_preference_report(_report(bytes(disabled)))
+        self.assertIsNone(hidden.alert_maximum_c)
+        self.assertIsNone(hidden.alert_minimum_c)
+        enabled_limit = bytearray(prefix)
+        enabled_limit[18] = 50 | 0x80
+        enabled_limit[19] = 0x80
+        decoded = parse_preference_report(_report(bytes(enabled_limit)))
+        self.assertEqual(decoded.alert_maximum_c, 50)
+        self.assertEqual(decoded.alert_minimum_c, 0)
+
+    def test_alert_metadata_matches_translations_icons_and_docs(self) -> None:
+        root = Path(__file__).parents[1]
+        strings = json.loads(
+            (root / "custom_components/airtouch/strings.json").read_text()
+        )
+        english = json.loads(
+            (root / "custom_components/airtouch/translations/en.json").read_text()
+        )
+        icons = json.loads((root / "custom_components/airtouch/icons.json").read_text())
+        self.assertEqual(strings["entity"], english["entity"])
+        expected = {
+            "alert_minimum": ("Alert minimum", "mdi:thermometer-alert"),
+            "alert_maximum": ("Alert maximum", "mdi:home-alert"),
+        }
+        for key, (name, icon) in expected.items():
+            self.assertEqual(strings["entity"]["number"][key]["name"], name)
+            self.assertEqual(icons["entity"]["number"][key]["default"], icon)
+        changelog = (root / "CHANGELOG.md").read_text()
+        readme = (root / "README.md").read_text()
+        self.assertIn(
+            "Added AirTouch 5 console numbers for the home alert minimum and maximum.",
+            changelog,
+        )
+        self.assertIn(
+            "Turning a threshold off is done on the AirTouch console.",
+            readme,
+        )
+        self.assertIn(
+            "This integration does not emit a Home Assistant event for that alert.",
+            readme,
+        )
 
     def test_truncated_and_unexpected_reports_fail(self) -> None:
         with self.assertRaises(PreferenceParseError):
@@ -718,6 +776,173 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PreferenceRejectedError):
             await coordinator.async_set(PreferenceField.AWAY_MINIMUM, True)  # noqa: FBT003
 
+    def _assert_one_byte(self, before: bytes, index: int, value: int) -> None:
+        written = self.writes[-1]
+        self.assertEqual(len(written), 32)
+        self.assertEqual(written[index], value)
+        for offset, byte in enumerate(before):
+            if offset != index:
+                self.assertEqual(written[offset], byte)
+
+    async def test_alert_writes_keep_every_other_preference_byte(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        numbers = self._numbers(coordinator)
+        maximum = numbers[PreferenceField.ALERT_MAXIMUM]
+        minimum = numbers[PreferenceField.ALERT_MINIMUM]
+        self.assertTrue(maximum.available)
+        self.assertIsNone(maximum.native_value)
+        self.assertIsNone(minimum.native_value)
+        before = self.prefix
+        await maximum.async_set_native_value(26)
+        self._assert_one_byte(before, 18, 26 | 0x80)
+        self.assertEqual(maximum.native_value, 26)
+        self.assertIsNone(minimum.native_value)
+        before = self.prefix
+        await minimum.async_set_native_value(0)
+        self._assert_one_byte(before, 19, 0x80)
+        self.assertEqual(minimum.native_value, 0)
+        self.assertEqual(maximum.native_value, 26)
+        snapshot = coordinator.data
+        assert snapshot is not None
+        self.assertEqual(snapshot.sleep_cool_c, 32)
+        self.assertEqual(snapshot.sleep_heat_c, 16)
+        self.assertEqual(snapshot.away_minimum_c, 18)
+        self.assertEqual(snapshot.away_maximum_c, 28)
+        before = self.prefix
+        await coordinator.async_set(PreferenceField.ALERT_MAXIMUM, None)
+        self._assert_one_byte(before, 18, 0)
+        self.assertIsNone(maximum.native_value)
+        self.assertEqual(minimum.native_value, 0)
+        self.assertTrue(maximum.available)
+
+    async def test_existing_fields_reject_none_before_a_write(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        before = self.connections
+        for field in (
+            PreferenceField.SLEEP_COOL,
+            PreferenceField.SLEEP_HEAT,
+            PreferenceField.AWAY_MINIMUM,
+            PreferenceField.AWAY_MAXIMUM,
+        ):
+            with self.subTest(field=field), self.assertRaises(PreferenceRejectedError):
+                await coordinator.async_set(field, None)
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+
+    async def test_alert_bounds_use_the_fresh_partner_and_ignore_disabled(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        numbers = self._numbers(coordinator)
+        minimum = numbers[PreferenceField.ALERT_MINIMUM]
+        enabled = bytearray(self.prefix)
+        enabled[18] = 20 | 0x80
+        self.prefix = bytes(enabled)
+        before = self.connections
+        with self.assertRaises(HomeAssistantError):
+            await minimum.async_set_native_value(21)
+        self.assertEqual(self.connections, before + 1)
+        self.assertEqual(self.writes, [])
+        self.assertIsNone(minimum.native_value)
+        await minimum.async_set_native_value(20)
+        self._assert_one_byte(bytes(enabled), 19, 20 | 0x80)
+        disabled = bytearray(_console_prefix())
+        disabled[18] = 0x11
+        disabled[19] = 0x22
+        self.prefix = bytes(disabled)
+        await coordinator.async_refresh()
+        await minimum.async_set_native_value(50)
+        self._assert_one_byte(bytes(disabled), 19, 50 | 0x80)
+        self.assertEqual(minimum.native_value, 50)
+        self.assertIsNone(numbers[PreferenceField.ALERT_MAXIMUM].native_value)
+
+    async def test_alert_rejections_and_readback_failures_do_not_write(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 21 | 0x80
+        prefix[19] = 10 | 0x80
+        self.prefix = bytes(prefix)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        number = self._numbers(coordinator)[PreferenceField.ALERT_MAXIMUM]
+        self.assertEqual(number.native_value, 21)
+        before = self.connections
+        for value in (51, -1, 10.5, True, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(HomeAssistantError):
+                await number.async_set_native_value(cast("float", value))
+        self.assertEqual(self.connections, before)
+        self.assertEqual(self.writes, [])
+        self.mode = "error"
+        with self.assertRaises(HomeAssistantError):
+            await number.async_set_native_value(22)
+        self.assertEqual(number.native_value, 21)
+        self.assertEqual(self.prefix[18], 21 | 0x80)
+        self.mode = "mismatch"
+        with self.assertRaises(HomeAssistantError):
+            await number.async_set_native_value(23)
+        self.assertEqual(number.native_value, 21)
+        self.assertEqual(self.prefix, bytes(prefix))
+
+    async def test_alert_and_sleep_changes_keep_both_bytes(self) -> None:
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        original = self.prefix
+        await asyncio.gather(
+            coordinator.async_set(PreferenceField.SLEEP_COOL, 24),
+            coordinator.async_set(PreferenceField.ALERT_MAXIMUM, 30),
+        )
+        self.assertEqual(self.max_active, 1)
+        self.assertEqual(len(self.writes), 2)
+        final = bytearray(original)
+        final[22] = 24
+        final[18] = 30 | 0x80
+        self.assertEqual(self.writes[-1], bytes(final))
+        changed = [
+            index
+            for index, byte in enumerate(self.writes[0])
+            if byte != original[index]
+        ]
+        self.assertEqual(len(changed), 1)
+        snapshot = coordinator.data
+        assert snapshot is not None
+        self.assertEqual(snapshot.sleep_cool_c, 24)
+        self.assertEqual(snapshot.alert_maximum_c, 30)
+        self.assertEqual(snapshot.away_minimum_c, 18)
+        self.assertEqual(snapshot.prefix[19], original[19])
+        self.assertEqual(snapshot.prefix[24:], original[24:])
+
+    async def test_alert_fahrenheit_service_uses_the_one_point_eight_step(self) -> None:
+        prefix = bytearray(_console_prefix())
+        prefix[18] = 21 | 0x80
+        prefix[19] = 21 | 0x80
+        self.prefix = bytes(prefix)
+        coordinator = self._coordinator()
+        await coordinator.async_refresh()
+        self.hass.config.units = US_CUSTOMARY_SYSTEM
+        numbers = self._numbers(coordinator)
+        for field, offset in (
+            (PreferenceField.ALERT_MAXIMUM, 18),
+            (PreferenceField.ALERT_MINIMUM, 19),
+        ):
+            with self.subTest(field=field):
+                number = numbers[field]
+                self.assertEqual(number.step, 1.8)
+                self.assertEqual(number.value, 69.8)
+                assert number.value is not None
+                before = bytes(self.prefix)
+                await cast("_NumberServiceModule", number_component).async_set_value(
+                    number,
+                    ServiceCall(
+                        cast("HomeAssistant", self.hass),
+                        "number",
+                        "set_value",
+                        {"value": number.value + number.step},
+                    ),
+                )
+                self._assert_one_byte(before, offset, 22 | 0x80)
+                self.assertEqual(number.native_value, 22)
+                self.assertEqual(number.value, 71.6)
+
     async def test_server_error_and_readback_mismatch_keep_the_previous_value(
         self,
     ) -> None:
@@ -853,11 +1078,13 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             await async_setup_entry(
                 cast("Any", self.hass), cast("Any", self.entry), add_entities
             )
-        self.assertEqual(len(added[1]), 4)
+        self.assertEqual(len(added[1]), 6)
         self.assertFalse(added[1][0].available)
         self.assertEqual(
             sorted(entity.unique_id for entity in added[1]),
             [
+                "hub_alert_maximum",
+                "hub_alert_minimum",
                 "hub_away_maximum",
                 "hub_away_minimum",
                 "hub_sleep_cool",
@@ -1032,7 +1259,7 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
             unique_id="hub",
             device_info=cast("Any", _DEVICE_INFO),
         )
-        self.assertEqual(len(first), 4)
+        self.assertEqual(len(first), 6)
         self.assertTrue(
             all(
                 isinstance(number, PreferenceNumber) and number.coordinator is owner
@@ -1199,7 +1426,7 @@ class PreferenceServerTests(unittest.IsolatedAsyncioTestCase):
         preference_numbers = [
             entity for entity in added if isinstance(entity, PreferenceNumber)
         ]
-        self.assertEqual(len(preference_numbers), 4)
+        self.assertEqual(len(preference_numbers), 6)
         self.assertTrue(all(not entity.available for entity in preference_numbers))
         self.assertIn("hub_ac0", [entity.unique_id for entity in added])
         owner = get_preferences(cast("Any", self.hass), entry.entry_id)
