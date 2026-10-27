@@ -5,7 +5,8 @@ header prefix, including the checksum. pyairtouch encodes the logical header
 and checksum. This module adds that escape and reads one matching frame before
 the deadline. Extended history uses message 0x1F and repeats the request.
 Smart settings use that message with an FF 18 reply prefix. Preference
-settings use the same framing with control message 0xC0.
+settings use the same framing with control message 0xC0. Some extended
+writes get no reply, so they are sent without reading.
 
 While answering a status query, the console can also push an extended
 message to every client. That push carries the console's own packet id, so it
@@ -196,8 +197,18 @@ class ConsoleClient:
         was written. ConsoleSendUncertainError means the connection failed
         after writing began. Nothing is retried.
         """
+        await self._send(ADDRESS_AIRTOUCH, CONTROL_MESSAGE_ID, payload)
+
+    async def send_extended(self, payload: bytes) -> None:
+        """Write one extended 0x1F message and close without waiting for any reply.
+
+        It has the same submission and failure meanings as send_control.
+        """
+        await self._send(ADDRESS_AIRTOUCH_EXTENDED, EXTENDED_MESSAGE_ID, payload)
+
+    async def _send(self, to_address: int, message_id: int, payload: bytes) -> None:
         async with self._lock:
-            _, frame = self._next_frame(ADDRESS_AIRTOUCH, CONTROL_MESSAGE_ID, payload)
+            _, frame = self._next_frame(to_address, message_id, payload)
             writer: asyncio.StreamWriter | None = None
             try:
                 async with asyncio.timeout(self._deadline):

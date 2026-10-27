@@ -34,6 +34,7 @@ _PROGRAMS = bytes.fromhex("ff41")
 _PROGRAMS_EXTENSION = bytes.fromhex("ff45")
 _BASE_BODY = bytes.fromhex("0000000000000102005555555510")
 _EXTENSION_BODY = bytes.fromhex("55555555555555")
+_EXTENDED_WRITE = bytes.fromhex("ff220147015555555501")
 
 
 def _oracle_escape(inner: bytes) -> bytes:
@@ -464,6 +465,70 @@ class ConsoleStatusAndSendTests(_ConsoleServerTestCase):
         self.assertIn(outcome, {"submitted", "uncertain"})
         await asyncio.wait_for(self.handled.wait(), 1)
         self.assertEqual([payload for _, payload in self.received], [_TRIGGER])
+
+    async def test_send_extended_returns_after_submission_without_a_reply(
+        self,
+    ) -> None:
+        self.replies = lambda header, payload: (
+            [] if payload == _EXTENDED_WRITE else _status_only(header, payload)
+        )
+        client = self._client(deadline=5)
+        await client.query_status(_STATUS_QUERY, broadcast_prefix=_NAMES)
+        self.assertIsNone(
+            await asyncio.wait_for(client.send_extended(_EXTENDED_WRITE), 1)
+        )
+        await client.query_status(_STATUS_QUERY, broadcast_prefix=_NAMES)
+        self.assertEqual(
+            self.raw[1],
+            _frame(
+                to_address=_EXTENDED,
+                from_address=_CLIENT,
+                packet_id=2,
+                message_id=_EXTENDED_MESSAGE,
+                payload=bytes.fromhex("ff220147015555555501"),
+            ),
+        )
+        self.assertIn(b"\x55\x55\x55\x00", self.raw[1])
+        self.assertEqual([header.packet_id for header, _ in self.received], [1, 2, 3])
+        self.assertEqual(await self._client_closes(3), [b"", b"", b""])
+
+    async def test_send_extended_failures_keep_send_only_meanings(self) -> None:
+        closed = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        port = closed.sockets[0].getsockname()[1]
+        closed.close()
+        await closed.wait_closed()
+        refused = console.ConsoleClient("127.0.0.1", port, deadline=1)
+        with self.assertRaises(OSError) as raised:
+            await refused.send_extended(_EXTENDED_WRITE)
+        self.assertNotIsInstance(raised.exception, console.ConsoleSendUncertainError)
+        self.assertEqual(self.received, [])
+
+        self.replies = lambda _header, _payload: []
+        for name, drain in (("reset", _reset_drain), ("stalled", _stalled_drain)):
+            with self.subTest(drain=name):
+                self.handled.clear()
+                with (
+                    patch.object(asyncio.StreamWriter, "drain", drain),
+                    self.assertRaises(console.ConsoleSendUncertainError),
+                ):
+                    await self._client(deadline=0.3).send_extended(_EXTENDED_WRITE)
+                await asyncio.wait_for(self.handled.wait(), 1)
+
+        self.handled.clear()
+        client = self._client(deadline=5)
+        with patch.object(asyncio.StreamWriter, "drain", _stalled_drain):
+            task = asyncio.create_task(client.send_extended(_EXTENDED_WRITE))
+            await asyncio.wait_for(self.handled.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.replies = _status_only
+        report, _ = await client.query_status(_STATUS_QUERY, broadcast_prefix=_NAMES)
+        self.assertEqual(report, _STATUS_REPORT)
+        self.assertEqual(
+            [payload for _, payload in self.received],
+            [_EXTENDED_WRITE, _EXTENDED_WRITE, _EXTENDED_WRITE, _STATUS_QUERY],
+        )
 
 
 class ConsolePairedReportTests(_ConsoleServerTestCase):
