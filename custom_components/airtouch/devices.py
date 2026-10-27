@@ -187,6 +187,31 @@ class AcDevice(BaseDevice):
         )
 
 
+class BeamDevice(BaseDevice):
+    """Device information for a Beam wireless air-conditioner.
+
+    Should be constructed using the beam_device() method on the AirTouchDevice class.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry_id: str,
+        airtouch_unique_id: str,
+        beam_id: bytes,
+        name: str,
+    ) -> None:
+        super().__init__(
+            hass=hass,
+            config_entry_id=config_entry_id,
+            unique_id=f"{airtouch_unique_id}_beam_{beam_id.hex()}",
+            name=name or "Beam",
+            manufacturer=MANUFACTURER,
+            model="Beam",
+            via_device=(DOMAIN, airtouch_unique_id),
+        )
+
+
 class AirTouchDevice(BaseDevice):
     """Device information for the AirTouch controller."""
 
@@ -217,6 +242,16 @@ class AirTouchDevice(BaseDevice):
             config_entry_id=self._config_entry_id,
             airtouch_unique_id=self.unique_id,
             airtouch_ac=airtouch_ac,
+        )
+
+    def beam_device(self, beam_id: bytes, name: str) -> BeamDevice:
+        """Construct device info for a Beam paired with the AirTouch console."""
+        return BeamDevice(
+            hass=self._hass,
+            config_entry_id=self._config_entry_id,
+            airtouch_unique_id=self.unique_id,
+            beam_id=beam_id,
+            name=name,
         )
 
 

@@ -114,6 +114,7 @@ _DEVICE_INFO: dict[str, object] = {
 }
 _CLIENT_MODULES = (
     "ac_settings",
+    "beam",
     "geofence",
     "io_outputs",
     "preferences",

@@ -12,6 +12,7 @@ from homeassistant.const import CONF_HOST, Platform
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .ac_settings import async_release_ac_settings
+from .beam import async_install_beam, async_release_beam
 from .const import (
     AIRTOUCH_MODEL_TO_API,
     CONF_AIRTOUCH_MODEL,
@@ -106,11 +107,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         io_outputs = async_install_io_outputs(hass, entry, airtouch)
         async_install_programs(hass, entry, airtouch)
         async_install_geofence(hass, entry, airtouch)
+        beam = async_install_beam(hass, entry, airtouch)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         if owner is not None:
             await owner.async_refresh()
         if io_outputs is not None:
             await io_outputs.async_refresh()
+        if beam is not None:
+            await beam.async_refresh()
     except BaseException:
         await _async_release_after_setup_failure(
             hass, entry.entry_id, release_smart=owner is not None
@@ -123,6 +127,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_release_after_setup_failure(
     hass: HomeAssistant, entry_id: str, *, release_smart: bool
 ) -> None:
+    try:
+        await async_release_beam(hass, entry_id)
+    except Exception:
+        _LOGGER.exception("Error releasing AirTouch Beams after setup failure")
     try:
         await async_release_geofence(hass, entry_id)
     except Exception:
@@ -155,6 +163,7 @@ async def _async_release_after_setup_failure(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await async_release_beam(hass, entry.entry_id)
         await async_release_geofence(hass, entry.entry_id)
         await async_release_programs(hass, entry.entry_id)
         await async_release_io_outputs(hass, entry.entry_id)

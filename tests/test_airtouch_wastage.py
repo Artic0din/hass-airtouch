@@ -321,11 +321,12 @@ class WastageServerTests(unittest.IsolatedAsyncioTestCase):
         self.hass = _Hass()
         self.entry = _Entry()
         self.coordinators: list[SmartSettingsCoordinator] = []
-        io_client = patch(
-            "custom_components.airtouch.io_outputs.ConsoleClient", self._io_client
-        )
-        io_client.start()
-        self.addCleanup(io_client.stop)
+        for module in ("io_outputs", "beam"):
+            client = patch(
+                f"custom_components.airtouch.{module}.ConsoleClient", self._io_client
+            )
+            client.start()
+            self.addCleanup(client.stop)
 
     async def asyncTearDown(self) -> None:
         self.release.set()

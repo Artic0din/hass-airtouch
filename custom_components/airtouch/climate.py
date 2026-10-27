@@ -1,19 +1,34 @@
 """Polyaire AirTouch Climate Devices."""
 
 import logging
+import math
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import replace
+from typing import Any, Final, cast
 
 import pyairtouch
 import voluptuous
 from homeassistant.components import climate
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature
+from homeassistant.const import PRECISION_TENTHS, PRECISION_WHOLE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.temperature import display_temp
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from . import devices, entities
+from .beam import (
+    BeamControl,
+    BeamCoordinator,
+    BeamEntity,
+    BeamFan,
+    BeamId,
+    BeamMode,
+    BeamRefusedError,
+    BeamUnit,
+    get_beam,
+)
 from .const import (
     DOMAIN,
     OPTIONS_ALLOW_ZONE_HVAC_MODE_CHANGES,
@@ -72,6 +87,28 @@ async def async_setup_entry(
 
     async_add_devices(discovered_entities)
 
+    if airtouch.model == pyairtouch.AirTouchModel.AIRTOUCH_5:
+        beams = get_beam(hass, config_entry.entry_id)
+
+        def add_beams(units: list[BeamUnit]) -> None:
+            min_step = config_entry.options.get(
+                OPTIONS_MIN_TARGET_TEMPERATURE_STEP,
+                OPTIONS_MIN_TARGET_TEMPERATURE_STEP_DEFAULT,
+            )
+            beam_entities = [
+                BeamClimateEntity(
+                    beams,
+                    airtouch_device.beam_device(unit.beam_id, unit.name),
+                    unit.beam_id,
+                    min_step,
+                )
+                for unit in units
+            ]
+            discovered_entities.extend(beam_entities)
+            async_add_devices(beam_entities)
+
+        config_entry.async_on_unload(beams.async_add_discovery(add_beams))
+
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
         name="set_hvac_mode_only",
@@ -107,6 +144,10 @@ async def async_setup_entry(
                     )
                     entity.update_allow_zone_hvac_mode_changes(
                         allow_mode_changes=allow_zone_hvac_mode_changes
+                    )
+                case BeamClimateEntity():
+                    entity.update_min_target_temperature_step(
+                        min_step=min_target_temperature_step
                     )
 
     config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
@@ -553,3 +594,198 @@ class ZoneClimateEntity(entities.AirTouchZoneEntity, climate.ClimateEntity):  # 
         # have been updated. However this update isn't triggered that often and
         # Home Assistant filters no-change updates internally.
         self.async_schedule_update_ha_state()
+
+
+_BEAM_TO_CLIMATE_HVAC_MODE: Final = {
+    BeamMode.AUTO: climate.HVACMode.HEAT_COOL,
+    BeamMode.HEAT: climate.HVACMode.HEAT,
+    BeamMode.DRY: climate.HVACMode.DRY,
+    BeamMode.FAN: climate.HVACMode.FAN_ONLY,
+    BeamMode.COOL: climate.HVACMode.COOL,
+}
+_CLIMATE_TO_BEAM_MODE: Final = {
+    value: key for key, value in _BEAM_TO_CLIMATE_HVAC_MODE.items()
+}
+_BEAM_TO_CLIMATE_FAN_MODE: Final = {
+    BeamFan.AUTO: climate.FAN_AUTO,
+    BeamFan.QUIET: "quiet",
+    BeamFan.LOW: climate.FAN_LOW,
+    BeamFan.MEDIUM: climate.FAN_MEDIUM,
+    BeamFan.HIGH: climate.FAN_HIGH,
+    BeamFan.POWERFUL: "powerful",
+    BeamFan.TURBO: "turbo",
+}
+_CLIMATE_TO_BEAM_FAN: Final = {
+    value: key for key, value in _BEAM_TO_CLIMATE_FAN_MODE.items()
+}
+_BEAM_MIN_STEP: Final = 1.0
+_FAHRENHEIT_PER_CELSIUS: Final = 1.8
+
+
+class BeamClimateEntity(BeamEntity, climate.ClimateEntity):
+    """A Beam wireless air-conditioner controlled through the console.
+
+    Targets are whole degrees Celsius. Fahrenheit shows tenths so each whole
+    Celsius value keeps its exact display, and the limits are the displayed
+    endpoints so Home Assistant accepts them. The owner checks the rounded
+    request against the Beam's fresh limits.
+    """
+
+    _attr_name = None  # Name comes from the device info
+    _attr_translation_key = "ac_climate"
+    _attr_device_class = "ac"
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+
+    def __init__(
+        self,
+        coordinator: BeamCoordinator,
+        beam_device: devices.BeamDevice,
+        beam_id: BeamId,
+        min_target_temperature_step: float,
+    ) -> None:
+        super().__init__(
+            coordinator, beam_id, beam_device.unique_id, beam_device.device_info
+        )
+        self._min_step = min_target_temperature_step
+        if hasattr(climate.ClimateEntityFeature, "TURN_OFF"):
+            self._enable_turn_on_off_backwards_compatibility = False
+
+    @property
+    def supported_features(self) -> climate.ClimateEntityFeature:
+        features = climate.ClimateEntityFeature(0)
+        if hasattr(climate.ClimateEntityFeature, "TURN_OFF"):
+            features |= (
+                climate.ClimateEntityFeature.TURN_OFF
+                | climate.ClimateEntityFeature.TURN_ON
+            )
+        unit = self._unit
+        if unit is not None and unit.selectable_fans:
+            features |= climate.ClimateEntityFeature.FAN_MODE
+        if unit is not None and unit.current_limits is not None:
+            features |= climate.ClimateEntityFeature.TARGET_TEMPERATURE
+        return features
+
+    @property
+    def hvac_modes(self) -> list[climate.HVACMode]:
+        unit = self._unit
+        modes = () if unit is None else unit.selectable_modes
+        return [climate.HVACMode.OFF] + [
+            _BEAM_TO_CLIMATE_HVAC_MODE[mode] for mode in modes
+        ]
+
+    @property
+    def hvac_mode(self) -> climate.HVACMode | None:
+        unit = self._unit
+        if unit is None or unit.is_on is None:
+            return None
+        if not unit.is_on:
+            return climate.HVACMode.OFF
+        mode = unit.displayed_mode
+        return None if mode is None else _BEAM_TO_CLIMATE_HVAC_MODE[mode]
+
+    @property
+    def fan_modes(self) -> list[str]:
+        unit = self._unit
+        fans = () if unit is None else unit.selectable_fans
+        return [_BEAM_TO_CLIMATE_FAN_MODE[fan] for fan in fans]
+
+    @property
+    def fan_mode(self) -> str | None:
+        unit = self._unit
+        fan = None if unit is None else unit.reported_fan
+        return None if fan is None else _BEAM_TO_CLIMATE_FAN_MODE[fan]
+
+    @property
+    def target_temperature(self) -> float | None:
+        unit = self._unit
+        return None if unit is None else unit.target_celsius
+
+    @property
+    def precision(self) -> float:
+        if self._fahrenheit:
+            return PRECISION_TENTHS
+        return PRECISION_WHOLE
+
+    @property
+    def target_temperature_step(self) -> float:
+        step = max(_BEAM_MIN_STEP, self._min_step)
+        return step * _FAHRENHEIT_PER_CELSIUS if self._fahrenheit else step
+
+    @property
+    def min_temp(self) -> float:
+        limits = self._limits
+        return super().min_temp if limits is None else self._displayed(limits[0])
+
+    @property
+    def max_temp(self) -> float:
+        limits = self._limits
+        return super().max_temp if limits is None else self._displayed(limits[1])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        unit = self._unit
+        if unit is None:
+            return None
+        attributes: dict[str, Any] = {"error_code": unit.error}
+        if not unit.selectable_fans:
+            # Home Assistant omits fan_mode without the fan mode feature.
+            attributes["reported_fan_mode"] = self.fan_mode
+        return attributes
+
+    @property
+    def _fahrenheit(self) -> bool:
+        unit: str = self.hass.config.units.temperature_unit
+        return unit == UnitOfTemperature.FAHRENHEIT
+
+    @property
+    def _limits(self) -> tuple[int, int] | None:
+        unit = self._unit
+        if unit is None:
+            return None
+        return unit.current_limits or (unit.target_celsius, unit.target_celsius)
+
+    def _displayed(self, celsius: int) -> float:
+        shown = cast(
+            "float",
+            display_temp(self.hass, celsius, self.temperature_unit, self.precision),
+        )
+        return TemperatureConverter.convert(
+            shown, self.hass.config.units.temperature_unit, self.temperature_unit
+        )
+
+    def update_min_target_temperature_step(self, min_step: float) -> None:
+        self._min_step = min_step
+        self.async_schedule_update_ha_state()
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:  # noqa: ANN401
+        temperature = float(kwargs[climate.ATTR_TEMPERATURE])
+        if not math.isfinite(temperature):
+            raise BeamRefusedError("Beam temperature must be finite")
+        hvac_mode = kwargs.get(climate.ATTR_HVAC_MODE)
+        control = BeamControl() if hvac_mode is None else self._power_control(hvac_mode)
+        await self._write(replace(control, celsius=math.floor(temperature + 0.5)))
+
+    async def async_set_hvac_mode(self, hvac_mode: climate.HVACMode) -> None:
+        await self._write(self._power_control(hvac_mode))
+
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        await self._write(BeamControl(fan=_CLIMATE_TO_BEAM_FAN[fan_mode]))
+
+    async def async_turn_on(self) -> None:
+        await self._write(BeamControl(power=True))
+
+    async def async_turn_off(self) -> None:
+        await self._write(BeamControl(power=False))
+
+    async def async_set_hvac_mode_only(self, hvac_mode: climate.HVACMode) -> None:
+        """Set the HVAC mode without changing the current power state."""
+        if hvac_mode not in _CLIMATE_TO_BEAM_MODE:
+            raise ValueError("Unsupported HVAC Mode")
+        await self._write(BeamControl(mode=_CLIMATE_TO_BEAM_MODE[hvac_mode]))
+
+    def _power_control(self, hvac_mode: climate.HVACMode) -> BeamControl:
+        if hvac_mode == climate.HVACMode.OFF:
+            return BeamControl(power=False)
+        if hvac_mode not in _CLIMATE_TO_BEAM_MODE:
+            raise BeamRefusedError("the Beam does not support that HVAC mode")
+        return BeamControl(power=True, mode=_CLIMATE_TO_BEAM_MODE[hvac_mode])

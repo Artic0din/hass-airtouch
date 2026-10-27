@@ -640,6 +640,57 @@ To set a timer to activate after a delay, use the [Set Timer (From Delay)](#-pol
  `unknown` | Indicates that the quick timer is not set.
 </details>
 
+### Beam climate and on/off timers (`climate.<beam_name>`, `time.<beam_name>_<on/off>_timer`)
+On an AirTouch 5, each Beam wireless air-conditioner paired with the console gets a climate entity and on and off timer time entities.
+Beams are found when the console reports them, including Beams paired after setup.
+A Beam the console stops reporting becomes unavailable, and its entities and their settings are kept for when it returns.
+The console's Beam report is read every 30 seconds.
+
+Each change reads the Beam's current report first, checks the request against the modes, fan speeds and temperature range the Beam reports, and then sends it once.
+The console does not acknowledge Beam changes, so a successful action means the change was sent, not that the Beam acted on it.
+The new state appears after a later report.
+If the connection fails after sending began, the action reports that the change may have been received, and it is not sent again.
+
+Beam temperatures are whole degrees Celsius.
+Requested temperatures are rounded to the nearest whole degree, with halves rounded up, so 20.5 °C sets 21 °C and 72 °F sets 22 °C.
+In Fahrenheit the target and limits are shown to a tenth of a degree, such as 60.8 °F for 16 °C.
+The step is 1 °C (1.8 °F), or the configured minimum step if it is larger.
+Home Assistant checks a temperature against the current mode's limits before the integration sees a new mode, so a `climate.set_temperature` action that also changes the mode is refused when the temperature is outside the current mode's limits.
+Change the mode first in that case.
+If the Beam reports no usable temperature range for its mode, the target temperature cannot be set.
+
+Known limits:
+
+* The current temperature is not shown. The console's own writer and reader disagree about how a Beam's temperature is encoded, and no report from a real Beam has been checked.
+* The console's Beam report can omit fan speed support. A Beam that reports none has no fan control, and its reported fan speed is shown in `reported_fan_mode`.
+* Medium fan is sent with the console's own code. The console names it `med` when passing it on to the Beam, and whether a Beam accepts that has not been checked.
+* Automatic heating and cooling are shown as `heat_cool`. Only Auto can be selected.
+* The timers belong to the console and use its local time. If both timers are set to the same minute, the console clears both at that minute and does not change power. Timers may not survive a console restart.
+
+<details>
+<summary>States and Attributes</summary>
+
+#### Climate States
+ State         | Description
+---------------|-------------
+ `off`         | The Beam is off.
+ `<mode>`      | The Beam is on in this mode.
+ `unknown`     | The Beam reports a mode or power state the integration does not recognise.
+ `unavailable` | The console does not report the Beam, reports it offline, or could not be read.
+
+#### Climate Attributes
+ Attribute           | Description
+---------------------|-------------
+ `error_code`        | The Beam's error code as the console reports it. 0 means no error.
+ `reported_fan_mode` | The reported fan speed, shown only when the Beam reports no fan speeds that can be set.
+
+#### Timer States
+ State     | Description
+-----------|-------------
+ `<time>`  | The console-local time at which the Beam will be turned on or off.
+ `unknown` | The timer is not set, or the console reports a time that is not valid.
+</details>
+
 ### :arrow_up: Update: Console (`update.<airtouch_name>_console`)
 An [**update**][hass-update] entity is created to represent the software update status of the AirTouch Console.
 
@@ -689,6 +740,9 @@ target:
 A service that sets an air-conditioner quick timer.
 
 This service can be used to set the on or off quick timer for an air-conditioner to activate after a specified delay. To activate a timer at a fixed time, use the built-in `time.set_value` service.
+
+For a Beam timer the delay must be 1 minute to 23 hours 59 minutes, in whole minutes.
+The console adds the delay to its own clock.
 
 #### Fields
  Field    | Description
