@@ -1147,6 +1147,7 @@ class IoOutputServerTests(unittest.IsolatedAsyncioTestCase):
             patch("custom_components.airtouch.smart_settings.ConsoleClient", client),
             patch("custom_components.airtouch.preferences.ConsoleClient", client),
             patch("custom_components.airtouch.io_outputs.ConsoleClient", client),
+            patch("custom_components.airtouch.beam.ConsoleClient", client),
             patch(
                 "custom_components.airtouch.devices.AirTouchDevice",
                 return_value=_Device(),

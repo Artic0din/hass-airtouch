@@ -13,6 +13,7 @@
 - Added AirTouch 5 relay output switches for Toggle outputs and buttons for Pulse outputs.
 - Added an AirTouch 5 Programs sensor that shows the weekly programs saved on the console and their settings. Programs still run on the console and cannot be changed from Home Assistant.
 - Added an AirTouch 5 Geofence sensor and a Post geofence presence action. The sensor shows the console's geofence air conditioners and accounts. The action sends one enter or exit event to the console's own geofence, which can create or update the account, and reports whether the console queued air conditioner commands.
+- Added climate entities and on and off timers for Beam wireless air conditioners paired with an AirTouch 5. Beam temperatures are whole degrees Celsius, the current temperature is not shown, and each change is sent once without confirmation from the console.
 
 ### Fixed
 

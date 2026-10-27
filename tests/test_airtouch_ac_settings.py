@@ -48,6 +48,7 @@ from custom_components.airtouch.ac_settings import (
     ensure_ac_settings,
     parse_ac_settings_report,
 )
+from custom_components.airtouch.beam import async_install_beam, async_release_beam
 from custom_components.airtouch.const import DOMAIN
 from custom_components.airtouch.const import AirTouchModel as SelectedModel
 from custom_components.airtouch.number import PreferenceNumber, async_setup_entry
@@ -954,6 +955,15 @@ class AcSettingsServerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(entities), 15)
         self.assertTrue(all(not entity.available for entity in entities))
+        async_install_beam(
+            cast("Any", self.hass),
+            cast("Any", self.entry),
+            cast("Any", airtouch),
+            port=self.port,
+        )
+        self.addAsyncCleanup(
+            async_release_beam, cast("Any", self.hass), self.entry.entry_id
+        )
         seen = self.connections
         added: list[Entity] = []
 

@@ -1095,6 +1095,7 @@ class ProgramRootTests(_ProgramServerCase):
             patch("custom_components.airtouch.preferences.ConsoleClient", client),
             patch("custom_components.airtouch.io_outputs.ConsoleClient", client),
             patch("custom_components.airtouch.programs.ConsoleClient", client),
+            patch("custom_components.airtouch.beam.ConsoleClient", client),
         ):
             yield
 
